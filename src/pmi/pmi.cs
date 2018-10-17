@@ -397,10 +397,10 @@ class PrepareAll : PrepareBase
 
                 if (_verbose)
                 {
-                    Console.Write($"Completed method {type.FullName}::{method.Name}");
+                    // Console.Write($"Completed method {type.FullName}::{method.Name}");
                     if (elapsedFunc != TimeSpan.MinValue)
                     {
-                        Console.WriteLine($", elapsed ms: {elapsedFunc.TotalMilliseconds:F2}");
+                        //Console.WriteLine($", elapsed ms: {elapsedFunc.TotalMilliseconds:F2}");
                     }
                     else
                     {
@@ -445,7 +445,7 @@ class PrepareOne : PrepareBase
 
     public override void AttemptMethod(Type type, MethodBase method)
     {
-        if (methodCount >= firstMethod)
+        // if (methodCount >= firstMethod)
         {
             methodsPrepared++;
 
@@ -459,16 +459,20 @@ class PrepareOne : PrepareBase
             }
             else
             {
+                bool skip = (methodCount < firstMethod);
                 Console.WriteLine($"PREPONE type# {typeCount} method# {methodCount} {type.FullName}::{method.Name}");
-                TimeSpan elapsedFunc = PrepareMethod(type, method);
-                Console.WriteLine($"Completed method {type.FullName}::{method.Name}");
-                if (elapsedFunc != TimeSpan.MinValue)
+                if (!skip)
                 {
-                    Console.WriteLine($", elapsed ms: {elapsedFunc.TotalMilliseconds:F2}");
-                }
-                else
-                {
-                    Console.WriteLine();
+                    TimeSpan elapsedFunc = PrepareMethod(type, method);
+                    Console.WriteLine($"Completed method {type.FullName}::{method.Name}");
+                    if (elapsedFunc != TimeSpan.MinValue)
+                    {
+                        // Console.WriteLine($", elapsed ms: {elapsedFunc.TotalMilliseconds:F2}");
+                    }
+                    else
+                    {
+                        Console.WriteLine();
+                    }
                 }
             }
         }
