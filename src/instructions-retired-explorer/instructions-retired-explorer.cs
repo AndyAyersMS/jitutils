@@ -1054,23 +1054,25 @@ namespace CoreClrInstRetired
                 }
 
                 if (samplePattern != null)
-                {
+                {   bool found = false;
                     foreach (var i in ImageMap)
                     {
-                        if (i.Key.Contains(samplePattern))
+                        if (i.Value.Name.Contains(samplePattern))
                         {
                             ImageInfo info = i.Value;
-                            Console.WriteLine("Raw samples for {info.Name} at 0x{info.BaseAddress:X16} -- 0x{info.EndAddress:X16} (length 0x{info.EndAddress - info.BaseAddress}:4X)");
+                            Console.WriteLine($"Raw samples for {info.Name} at 0x{info.BaseAddress:X16} -- 0x{info.EndAddress:X16} (length 0x{info.EndAddress - info.BaseAddress:X4})");
 
                             foreach (ulong address in SampleCountMap.Keys)
                             {
                                 if ((address >= info.BaseAddress) && (address <= info.EndAddress))
                                 {
-                                    Console.WriteLine("0x{address - info.BaseAddress:4X} : {SampleCountMap[address]}");
+                                    found = true;
+                                    Console.WriteLine($"0x{address - info.BaseAddress:X4} : {SampleCountMap[address]}");
                                 }
                             }
                         }
                     }
+                    if (!found) Console.WriteLine($"No samples found for methods matching {samplePattern}");
                 }
             }
 
