@@ -49,6 +49,7 @@ namespace LLMFuzz
         MutantBadExitCode,
         HasDependentProjects,
         NoFileAccess,
+        BadLLMResponse,
         SkipSpecialCase
     }
 
@@ -70,7 +71,7 @@ namespace LLMFuzz
 
         public bool MutantRunFailed => kind == ExecutionResultKind.MutantThrewException || kind == ExecutionResultKind.MutantBadExitCode;
 
-        public bool NoMutationsAttempted => kind == ExecutionResultKind.SizeTooLarge || kind == ExecutionResultKind.RanTooLong;
+        public bool NoMutationsAttempted => kind == ExecutionResultKind.SizeTooLarge || kind == ExecutionResultKind.RanTooLong || kind == ExecutionResultKind.BadLLMResponse;
 
         public override string ToString()
         {
@@ -92,6 +93,7 @@ namespace LLMFuzz
                 case ExecutionResultKind.MutantBadExitCode: return $"mutant execution returned bad exit code {value}";
                 case ExecutionResultKind.HasDependentProjects: return "base project has dependent projects";
                 case ExecutionResultKind.NoFileAccess: return "file access error";
+                case ExecutionResultKind.BadLLMResponse: return "Bad LLM response";
                 case ExecutionResultKind.SkipSpecialCase: return "test is on internal skip list";
             }
 
@@ -105,7 +107,7 @@ namespace LLMFuzz
         public static int TimeLimit;
         public static bool Verbose;
 
-        public static string Core_Root = @"d:\repos\runtime0\artifacts\tests\coreclr\windows.x64.checked\Tests\Core_Root";
+        public static string Core_Root = Environment.GetEnvironmentVariable("CORE_ROOT") ?? throw new InvalidOperationException("Environment variable 'CORE_ROOT' is not set.");
 
         private static readonly CSharpCompilationOptions DebugOptions =
             new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, concurrentBuild: false, optimizationLevel: OptimizationLevel.Debug).WithAllowUnsafe(true);
@@ -151,7 +153,7 @@ namespace LLMFuzz
             int variantFailedToCompile = 0;
             int variantFailedToRun = 0;
 
-            string inputFilePath = @"d:\repos\runtime0\src\tests\jit\Regression\JitBlue\Runtime_110306\Runtime_110306.cs";
+            string inputFilePath = Environment.GetEnvironmentVariable("TEST_PATH") ?? throw new InvalidOperationException("Environment variable 'TEST_PATH' is not set.");
             bool recursive = Directory.Exists(inputFilePath);
             if (recursive)
             {
@@ -243,42 +245,52 @@ namespace LLMFuzz
 
         private ExecutionResult MutateOneTestFile(string testFile, ref int attempted, ref int failedToCompile, ref int failedToRun)
         {
-            if (!_quiet)
-            {
-                Console.WriteLine("---------------------------------------");
-                Console.WriteLine("// Original Program");
-            }
-
             // Access input and build parse tree
             if (!File.Exists(testFile))
             {
                 return new ExecutionResult() { kind = ExecutionResultKind.NoFileAccess };
             }
 
+            const uint numMutations = 4;
             bool hadFailures = false;
             string inputText = File.ReadAllText(testFile);
+            string response = QueryLLMForMutation(inputText,
+@$"Please mutate this code {numMutations} times to introduce other C# language features. Each mutation should be done to the previous version of the mutated code. Below are the rules for the mutations:
 
-            for (int version = 0; version < 5; version++)
-            {
-                string mutatedText = inputText;
-                if (version > 0)
-                {
-                   mutatedText = QueryLLMForMutation(inputText, 
-                       @"Please modify this code to introduce other C# language features. 
 A loop is clonable if it contains array references and the loop bounds are loop invariant but not constants or the array length.
 Also include some examples of clonable loops.
 Make sure to add appropriate using statements for any newly added types. 
 Do not use any sources of randomness or nondeterminisim in the new code.
-Return just the modified program and no other output.");
 
+Return just the modified programs. Don't include any text in between each program in your response.");
+
+            if (response == null)
+            {
+                return new ExecutionResult() { kind = ExecutionResultKind.BadLLMResponse };
+            }
+
+            string[] mutations = response.Split("```csharp");
+
+            if (mutations.Length == 0)
+            {
+                return new ExecutionResult() { kind = ExecutionResultKind.BadLLMResponse };
+            }
+
+            for (int i = 1; i < mutations.Length; i++)
+            {
+                mutations[i] = mutations[i].Replace("```", string.Empty);
+            }
+
+            mutations[0] = inputText;
+
+            for (int version = 0; version < numMutations + 1; version++)
+            {
+                if (version > 0)
+                {
                     attempted++;
                 }
 
-                if (mutatedText == null)
-                    continue;
-
-                mutatedText = mutatedText.Replace("```csharp", string.Empty);
-                mutatedText = mutatedText.Replace("```", string.Empty);
+                string mutatedText = mutations[version];
 
                 Console.WriteLine($"\n\n*** Version {version} *****");
                 Console.WriteLine(mutatedText);
