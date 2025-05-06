@@ -105,15 +105,17 @@ namespace LLMFuzz
     {
         public static int SizeLimit;
         public static int TimeLimit;
+        public static int VersionLimit = 10;
         public static bool Verbose;
 
         public static string Core_Root = Environment.GetEnvironmentVariable("CORE_ROOT") ?? throw new InvalidOperationException("Environment variable 'CORE_ROOT' is not set.");
 
         private static readonly CSharpCompilationOptions DebugOptions =
-            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, concurrentBuild: false, optimizationLevel: OptimizationLevel.Debug).WithAllowUnsafe(true);
+            new CSharpCompilationOptions(OutputKind.ConsoleApplication, concurrentBuild: false, optimizationLevel: OptimizationLevel.Debug).WithAllowUnsafe(true);
 
+        // OutputKind.DynamicallyLinkedLibrary
         private static readonly CSharpCompilationOptions ReleaseOptions =
-            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, concurrentBuild: false, optimizationLevel: OptimizationLevel.Release).WithAllowUnsafe(true);
+            new CSharpCompilationOptions(OutputKind.ConsoleApplication, concurrentBuild: false, optimizationLevel: OptimizationLevel.Release).WithAllowUnsafe(true);
 
         private static readonly CSharpParseOptions ParseOptions = new CSharpParseOptions(LanguageVersion.Latest);
 
@@ -124,6 +126,7 @@ namespace LLMFuzz
             MetadataReference.CreateFromFile(Path.Combine(Core_Root, "System.Console.dll")),
             MetadataReference.CreateFromFile(Path.Combine(Core_Root, "System.Linq.dll")),
             MetadataReference.CreateFromFile(Path.Combine(Core_Root, "System.Collections.dll")),
+            MetadataReference.CreateFromFile(Path.Combine(Core_Root, "System.Collections.Immutable.dll")),
             MetadataReference.CreateFromFile(Path.Combine(Core_Root, "xunit.core.dll"))
         };
 
@@ -134,7 +137,7 @@ namespace LLMFuzz
         {
             var p = new Program();
             p._random = new Random(42);
-            p._quiet = false;
+            p._quiet = true;
 
             SizeLimit = 10000;
             TimeLimit = 10000;
@@ -165,6 +168,12 @@ namespace LLMFuzz
 
                 foreach (var subInputFile in inputFiles)
                 {
+                    // hack to avoid reprocessing earlier outputs
+                    if (subInputFile.Contains("-"))
+                    {
+                        skipped++;
+                        continue;
+                    }
                     total++;
 
                     int subVariantTotal = 0;
@@ -218,6 +227,8 @@ namespace LLMFuzz
             }
             else
             {
+                Console.WriteLine($"// *** LLM-Fuzz {inputFilePath} ***");
+
                 ExecutionResult result = MutateOneTestFile(inputFilePath, ref variantTotal, ref variantFailedToCompile, ref variantFailedToRun);
 
                 if (result.Success)
@@ -251,16 +262,27 @@ namespace LLMFuzz
                 return new ExecutionResult() { kind = ExecutionResultKind.NoFileAccess };
             }
 
-            const uint numMutations = 4;
             bool hadFailures = false;
+
             string inputText = File.ReadAllText(testFile);
             string response = QueryLLMForMutation(inputText,
-@$"Please mutate this code {numMutations} times to introduce other C# language features. Each mutation should be done to the previous version of the mutated code. Below are the rules for the mutations:
+                @$"Please mutate this code {VersionLimit} times to introduce other C# language features.
+Each mutation should be done to the previous version of the mutated code. Below are the rules for the mutations:
 
-A loop is clonable if it contains array references and the loop bounds are loop invariant but not constants or the array length.
-Also include some examples of clonable loops.
+A loop is clonable if it contains array references and the loop bounds are loop invariant but not constants or the array length,
+or if it includes a virtual or interface call on a variable that is not modified in the loop body.
+Include several examples of clonable loops.
+Try and reuse the same arrays in multiple loops.
 Make sure to add appropriate using statements for any newly added types. 
+Include control flow so that some of the loops execute only under certain conditions.
 Do not use any sources of randomness or nondeterminisim in the new code.
+Do not use nullable.
+Remove any check for AVX512F.VL.
+Add a checksum computation to the code to fingerprint the program behavior. 
+The program must print the checksum value at some points during execution and at the end of the program.
+Ensure that the checksum is not zero if the execution is successful and changes as the program progresses.
+Rename any method with a [Fact] attribute to be the main entry point of a console application.
+Do not modify the return code of the main method.
 
 Return just the modified programs. Don't include any text in between each program in your response.");
 
@@ -283,19 +305,22 @@ Return just the modified programs. Don't include any text in between each progra
 
             mutations[0] = inputText;
 
-            for (int version = 0; version < numMutations + 1; version++)
+            for (int version = 0; version < mutations.Length; version++)
             {
-                if (version > 0)
-                {
-                    attempted++;
-                }
-
+                bool isMutant = true;
+                attempted++;
                 string mutatedText = mutations[version];
 
-                Console.WriteLine($"\n\n*** Version {version} *****");
-                Console.WriteLine(mutatedText);
-
                 string name = $"{Path.GetFileNameWithoutExtension(testFile)}-{version}";
+                string mutantFile = Path.Join(Path.GetDirectoryName(testFile), name + ".cs");
+
+                if (!_quiet)
+                {
+                    Console.WriteLine($"\n\n*** Version {version}: {name} *****");
+                    Console.WriteLine(mutatedText);
+                }
+
+                File.WriteAllText(mutantFile, mutatedText);
 
                 SyntaxTree mutatedTree = CSharpSyntaxTree.ParseText(mutatedText,
                         path: version == 0 ? testFile : $"{name}.cs",
@@ -304,12 +329,17 @@ Return just the modified programs. Don't include any text in between each progra
                 SyntaxTree[] mutatedTrees = { mutatedTree };
 
                 CSharpCompilation debugCompilation = CSharpCompilation.Create(name, mutatedTrees, References, DebugOptions);
-                (ExecutionResult debugResult, string debugstdout, string debugstderr) = CompileAndExecute(debugCompilation, name, version == 0);
+                (ExecutionResult debugResult, string debugstdout, string debugstderr) = CompileAndExecute(debugCompilation, name, isMutant);
+
+                string debugOutFile = Path.Join(Path.GetDirectoryName(testFile), name + ".debug.out");
+                File.WriteAllText(debugOutFile, $"### EXIT CODE {debugResult.value}\n### STDOUT\n{debugstdout}\n### STDERR\n{debugstderr}");
                 
+
                 if (debugResult.CompileFailed)
                 {
                     failedToCompile++;
-                    Console.WriteLine($"*** Version {version} failed to compile *****");
+                    hadFailures = true;
+                    Console.WriteLine($"*** {name} failed to compile *****");
                     continue;
                 }
 
@@ -317,13 +347,31 @@ Return just the modified programs. Don't include any text in between each progra
                 {
                     failedToRun++;
                     hadFailures = true;
-                    Console.WriteLine($"*** Version {version} failed to run *****");
+                    Console.WriteLine($"*** {name} failed to run *****");
 
                     continue;
                 }
 
+                // Verify debug output is repeatable...
+
+                (ExecutionResult debugResult1, string debugstdout1, string debugstderr1) = CompileAndExecute(debugCompilation, name, isMutant);
+
+                string debugOutFile1 = Path.Join(Path.GetDirectoryName(testFile), name + ".debug.out.1");
+                File.WriteAllText(debugOutFile1, $"### EXIT CODE {debugResult.value}\n### STDOUT\n{debugstdout}\n### STDERR\n{debugstderr}");
+
+                if (debugstdout != debugstdout1 || debugstderr != debugstderr1)
+                {
+                    failedToRun++;
+                    hadFailures = true;
+                    Console.WriteLine($"*** {name} debug is non-determinsitic {debugOutFile} and {debugOutFile1} *****");
+                    continue;
+                }
+
                 CSharpCompilation releaseCompilation = CSharpCompilation.Create(name, mutatedTrees, References, ReleaseOptions);
-                (ExecutionResult releaseResult, string releasestdout, string releasestderr) = CompileAndExecute(releaseCompilation, name, version == 0);
+                (ExecutionResult releaseResult, string releasestdout, string releasestderr) = CompileAndExecute(releaseCompilation, name, isMutant);
+
+                string releaseOutFile = Path.Join(Path.GetDirectoryName(testFile), name + ".release.out");
+                File.WriteAllText(releaseOutFile, $"### EXIT CODE {releaseResult.value}\n### STDOUT\n{releasestdout}\n### STDERR\n{releasestderr}");
 
                 // todo verify same outputs
 
@@ -331,7 +379,7 @@ Return just the modified programs. Don't include any text in between each progra
                 {
                     failedToRun++;
                     hadFailures = true;
-                    Console.WriteLine($"*** Version {version} debug/release fail difference *****");
+                    Console.WriteLine($"*** {name} debug/release fail difference, compare {debugOutFile} and {releaseOutFile} *****");
                     continue;
                 }
 
@@ -339,9 +387,11 @@ Return just the modified programs. Don't include any text in between each progra
                 {
                     failedToRun++;
                     hadFailures = true;
-                    Console.WriteLine($"*** Version {version} debug/release output difference *****");
+                    Console.WriteLine($"*** {name} debug/release output difference, compare {debugOutFile} and {releaseOutFile} *****");
                     continue;
                 }
+
+                Console.WriteLine($"*** {name} debug/release matched");
             }
 
             if (hadFailures)
@@ -349,15 +399,18 @@ Return just the modified programs. Don't include any text in between each progra
                 return new ExecutionResult() { kind = ExecutionResultKind.HadFailures };
             }
             else
+            { 
                 return new ExecutionResult() { kind = ExecutionResultKind.RanNormally };
-            {
-                    
             }
         }
+        
         private string QueryLLMForMutation(string inputCode, string prompt)
         {
             try
             {
+                Stopwatch stopwatch = new Stopwatch();
+                stopwatch.Start();
+
                 // Read the endpoint and API key from environment variables
                 var endpoint = Environment.GetEnvironmentVariable("OPENAI_ENDPOINT")
                                ?? throw new InvalidOperationException("Environment variable 'OPENAI_ENDPOINT' is not set.");
@@ -365,11 +418,20 @@ Return just the modified programs. Don't include any text in between each progra
                              ?? throw new InvalidOperationException("Environment variable 'OPENAI_API_KEY' is not set.");
 
                 var deploymentName = "gpt-4.1";
+                //var deploymentName = "o4-mini";
+                var model = "o4-mini";
 
                 AzureOpenAIClient azureClient = new(
                     new Uri(endpoint),
                     new AzureKeyCredential(apiKey));
                 ChatClient chatClient = azureClient.GetChatClient(deploymentName);
+
+                //var requestOptions = new ChatCompletionOptions()
+                //{
+                //    Model = model
+                //};
+
+                //requestOptions.
 
                 List<ChatMessage> messages = new List<ChatMessage>()
                 {
@@ -380,6 +442,10 @@ Return just the modified programs. Don't include any text in between each progra
                 };
 
                 var response = chatClient.CompleteChat(messages);
+
+                stopwatch.Stop();
+                Console.WriteLine($"LLM {deploymentName} query took {stopwatch.ElapsedMilliseconds} ms");
+
                 return response.Value.Content[0].Text;
 
             }
@@ -455,14 +521,20 @@ Return just the modified programs. Don't include any text in between each progra
                     ProcessStartInfo psi = new ProcessStartInfo
                     {
                         FileName = Path.Combine(Core_Root, "corerun.exe"),
-                        Arguments = $"{Path.Combine(Core_Root, "xunit.console.dll")} {testAssemblyName} -quiet",
+                        // Arguments = $"{Path.Combine(Core_Root, "xunit.console.dll")} {testAssemblyName} -nologo -quiet",
+                        Arguments = testAssemblyName,
                         UseShellExecute = false,
                         RedirectStandardOutput = true,
                         RedirectStandardError = true,
                         CreateNoWindow = true,
                     };
 
-                    Console.WriteLine($"// Running '{name}' via {psi.FileName} {psi.Arguments}");
+                    psi.EnvironmentVariables["DOTNET_TieredCompilation"] = "0";
+
+                    if (!_quiet)
+                    {
+                        Console.WriteLine($"// Running '{name}' via {psi.FileName} {psi.Arguments}");
+                    }
 
                     // Start the process
                     using (Process process = Process.Start(psi))
@@ -474,16 +546,20 @@ Return just the modified programs. Don't include any text in between each progra
                         // Wait for the process to exit
                         process.WaitForExit();
 
-                        // Display the captured output
-                        Console.WriteLine("Standard Output:");
-                        Console.WriteLine(standardOutput);
+                        if (!_quiet)
+                        {
 
-                        Console.WriteLine("Standard Error:");
-                        Console.WriteLine(standardError);
+                            // Display the captured output
+                            Console.WriteLine("Standard Output:");
+                            Console.WriteLine(standardOutput);
+
+                            Console.WriteLine("Standard Error:");
+                            Console.WriteLine(standardError);
+                        }
 
                         result = process.ExitCode;
 
-                        if (result != 0)
+                        if (result != 0 && result != 100)
                         {
                             Console.WriteLine($"// Execution of '{name}' failed (exitCode {result})");
                             return (new ExecutionResult() { kind = isMutant ? ExecutionResultKind.MutantBadExitCode : ExecutionResultKind.BadExitCode, value = result }, standardOutput, standardError);
