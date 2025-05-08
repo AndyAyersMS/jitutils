@@ -49,6 +49,7 @@ namespace LLMFuzz
         MutantBadExitCode,
         HasDependentProjects,
         NoFileAccess,
+        BadLLMResponse,
         SkipSpecialCase
     }
 
@@ -70,7 +71,7 @@ namespace LLMFuzz
 
         public bool MutantRunFailed => kind == ExecutionResultKind.MutantThrewException || kind == ExecutionResultKind.MutantBadExitCode;
 
-        public bool NoMutationsAttempted => kind == ExecutionResultKind.SizeTooLarge || kind == ExecutionResultKind.RanTooLong;
+        public bool NoMutationsAttempted => kind == ExecutionResultKind.SizeTooLarge || kind == ExecutionResultKind.RanTooLong || kind == ExecutionResultKind.BadLLMResponse;
 
         public override string ToString()
         {
@@ -92,6 +93,7 @@ namespace LLMFuzz
                 case ExecutionResultKind.MutantBadExitCode: return $"mutant execution returned bad exit code {value}";
                 case ExecutionResultKind.HasDependentProjects: return "base project has dependent projects";
                 case ExecutionResultKind.NoFileAccess: return "file access error";
+                case ExecutionResultKind.BadLLMResponse: return "Bad LLM response";
                 case ExecutionResultKind.SkipSpecialCase: return "test is on internal skip list";
             }
 
@@ -106,7 +108,7 @@ namespace LLMFuzz
         public static int VersionLimit = 10;
         public static bool Verbose;
 
-        public static string Core_Root = @"d:\repos\runtime0\artifacts\tests\coreclr\windows.x64.checked\Tests\Core_Root";
+        public static string Core_Root = Environment.GetEnvironmentVariable("CORE_ROOT") ?? throw new InvalidOperationException("Environment variable 'CORE_ROOT' is not set.");
 
         private static readonly CSharpCompilationOptions DebugOptions =
             new CSharpCompilationOptions(OutputKind.ConsoleApplication, concurrentBuild: false, optimizationLevel: OptimizationLevel.Debug).WithAllowUnsafe(true);
@@ -154,7 +156,7 @@ namespace LLMFuzz
             int variantFailedToCompile = 0;
             int variantFailedToRun = 0;
 
-            string inputFilePath = @"d:\repos\runtime0\src\tests\jit\Regression\JitBlue\";
+            string inputFilePath = Environment.GetEnvironmentVariable("TEST_PATH") ?? throw new InvalidOperationException("Environment variable 'TEST_PATH' is not set.");
             bool recursive = Directory.Exists(inputFilePath);
             if (recursive)
             {
@@ -254,12 +256,6 @@ namespace LLMFuzz
 
         private ExecutionResult MutateOneTestFile(string testFile, ref int attempted, ref int failedToCompile, ref int failedToRun)
         {
-            if (!_quiet)
-            {
-                Console.WriteLine("---------------------------------------");
-                Console.WriteLine("// Original Program");
-            }
-
             // Access input and build parse tree
             if (!File.Exists(testFile))
             {
@@ -267,18 +263,13 @@ namespace LLMFuzz
             }
 
             bool hadFailures = false;
-            string originalText = File.ReadAllText(testFile);
-            string inputText = originalText;
 
-            for (int version = 0; version < VersionLimit; version++)
-            {
-                string mutatedText = inputText;
-                bool isMutant = version > 0;
-                isMutant = true;
-                // if (version > 0)
-                {
-                    mutatedText = QueryLLMForMutation(inputText,
-                        @"A loop is clonable if it contains array references and the loop bounds are loop invariant but not constants or the array length,
+            string inputText = File.ReadAllText(testFile);
+            string response = QueryLLMForMutation(inputText,
+                @$"Please mutate this code {VersionLimit} times to introduce other C# language features.
+Each mutation should be done to the previous version of the mutated code. Below are the rules for the mutations:
+
+A loop is clonable if it contains array references and the loop bounds are loop invariant but not constants or the array length,
 or if it includes a virtual or interface call on a variable that is not modified in the loop body.
 Include several examples of clonable loops.
 Try and reuse the same arrays in multiple loops.
@@ -292,16 +283,33 @@ The program must print the checksum value at some points during execution and at
 Ensure that the checksum is not zero if the execution is successful and changes as the program progresses.
 Rename any method with a [Fact] attribute to be the main entry point of a console application.
 Do not modify the return code of the main method.
-Return just the modified program and no other output.");
 
-                    attempted++;
-                }
+Return just the modified programs. Don't include any text in between each program in your response.");
 
-                if (mutatedText == null)
-                    continue;
+            if (response == null)
+            {
+                return new ExecutionResult() { kind = ExecutionResultKind.BadLLMResponse };
+            }
 
-                mutatedText = mutatedText.Replace("```csharp", string.Empty);
-                mutatedText = mutatedText.Replace("```", string.Empty);
+            string[] mutations = response.Split("```csharp");
+
+            if (mutations.Length == 0)
+            {
+                return new ExecutionResult() { kind = ExecutionResultKind.BadLLMResponse };
+            }
+
+            for (int i = 1; i < mutations.Length; i++)
+            {
+                mutations[i] = mutations[i].Replace("```", string.Empty);
+            }
+
+            mutations[0] = inputText;
+
+            for (int version = 0; version < mutations.Length; version++)
+            {
+                bool isMutant = true;
+                attempted++;
+                string mutatedText = mutations[version];
 
                 string name = $"{Path.GetFileNameWithoutExtension(testFile)}-{version}";
                 string mutantFile = Path.Join(Path.GetDirectoryName(testFile), name + ".cs");
@@ -384,17 +392,6 @@ Return just the modified program and no other output.");
                 }
 
                 Console.WriteLine($"*** {name} debug/release matched");
-
-                // If successful, use the mutated text as input for the next iteration... 
-
-                if (version % 5 == 4)
-                {
-                    inputText = originalText;
-                }
-                else
-                {
-                    inputText = mutatedText;
-                }
             }
 
             if (hadFailures)
