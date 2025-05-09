@@ -5,6 +5,7 @@
 using Azure;
 using Azure.AI.OpenAI;
 using Azure.Core;
+using Microsoft.Build.ObjectModelRemoting;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Emit;
@@ -110,8 +111,8 @@ namespace LLMFuzz
 
         public static string Core_Root = Environment.GetEnvironmentVariable("CORE_ROOT") ?? throw new InvalidOperationException("Environment variable 'CORE_ROOT' is not set.");
 
-        private static readonly CSharpCompilationOptions DebugOptions =
-            new CSharpCompilationOptions(OutputKind.ConsoleApplication, concurrentBuild: false, optimizationLevel: OptimizationLevel.Debug).WithAllowUnsafe(true);
+        //private static readonly CSharpCompilationOptions DebugOptions =
+        //    new CSharpCompilationOptions(OutputKind.ConsoleApplication, concurrentBuild: false, optimizationLevel: OptimizationLevel.Debug).WithAllowUnsafe(true);
 
         // OutputKind.DynamicallyLinkedLibrary
         private static readonly CSharpCompilationOptions ReleaseOptions =
@@ -156,6 +157,16 @@ namespace LLMFuzz
             int variantFailedToCompile = 0;
             int variantFailedToRun = 0;
 
+            string cacheDir = Path.Combine(Path.GetTempPath(), "llm-fuzz");
+            if (Directory.Exists(cacheDir))
+            {
+                Console.WriteLine($"Cleaning cache directory: {cacheDir}");
+                Directory.Delete(cacheDir, true);
+            }
+
+            Console.WriteLine($"Caching assemblies in: {cacheDir}");
+            Directory.CreateDirectory(cacheDir);
+
             string inputFilePath = Environment.GetEnvironmentVariable("TEST_PATH") ?? throw new InvalidOperationException("Environment variable 'TEST_PATH' is not set.");
             bool recursive = Directory.Exists(inputFilePath);
             if (recursive)
@@ -166,15 +177,17 @@ namespace LLMFuzz
 
                 Console.WriteLine($"Processing {inputFiles.Count()} files\n");
 
-                foreach (var subInputFile in inputFiles)
+                Parallel.ForEach(inputFiles, new ParallelOptions() { MaxDegreeOfParallelism = 10 }, subInputFile =>
                 {
                     // hack to avoid reprocessing earlier outputs
                     if (subInputFile.Contains("-"))
                     {
                         skipped++;
-                        continue;
+                        return;
                     }
                     total++;
+
+                    Console.WriteLine($"\n// *** LLM-Fuzz {subInputFile} {DateTime.Now.ToShortTimeString()} ***");
 
                     int subVariantTotal = 0;
                     int subVariantFailedToCompile = 0;
@@ -211,7 +224,7 @@ namespace LLMFuzz
                     variantTotal += subVariantTotal;
                     variantFailedToCompile += subVariantFailedToCompile;
                     variantFailedToRun += subVariantFailedToRun;
-                }
+                });
 
                 Console.WriteLine($"Final Results: {total} files, {succeeded} succeeded, {skipped} skipped, {failed} failed");
                 Console.WriteLine($"{variantTotal} total variants attempted,  {variantFailedToCompile} did not compile, {variantFailedToRun} did not run.");
@@ -227,7 +240,7 @@ namespace LLMFuzz
             }
             else
             {
-                Console.WriteLine($"// *** LLM-Fuzz {inputFilePath} ***");
+                Console.WriteLine($"\n// *** LLM-Fuzz {inputFilePath} {DateTime.Now.ToShortTimeString} ***");
 
                 ExecutionResult result = MutateOneTestFile(inputFilePath, ref variantTotal, ref variantFailedToCompile, ref variantFailedToRun);
 
@@ -275,13 +288,16 @@ Include several examples of clonable loops.
 Try and reuse the same arrays in multiple loops.
 Make sure to add appropriate using statements for any newly added types. 
 Include control flow so that some of the loops execute only under certain conditions.
-Do not use any sources of randomness or nondeterminisim in the new code.
+Do not use any sources of randomness or non-determinism in the new code.
+Do not use Random or any other source of randomness.
 Do not use nullable.
 Remove any check for AVX512F.VL.
 Add a checksum computation to the code to fingerprint the program behavior. 
 The program must print the checksum value at some points during execution and at the end of the program.
 Ensure that the checksum is not zero if the execution is successful and changes as the program progresses.
-Rename any method with a [Fact] attribute to be the main entry point of a console application.
+Rename any method with a [Fact] attribute to be the main entry point of a console application. 
+The entry point must be a public static void method called Main that takes no arguments.
+If there are multiple methods with [Fact] attributes just choose one as the main method.
 Do not modify the return code of the main method.
 
 Return just the modified programs. Don't include any text in between each program in your response.");
@@ -298,17 +314,35 @@ Return just the modified programs. Don't include any text in between each progra
                 return new ExecutionResult() { kind = ExecutionResultKind.BadLLMResponse };
             }
 
-            for (int i = 1; i < mutations.Length; i++)
+            int versions = 0;
+
+            for (int i = 0; i < mutations.Length; i++)
             {
-                mutations[i] = mutations[i].Replace("```", string.Empty);
+                string mutant = mutations[i].Replace("```", string.Empty);
+
+                if (mutant.Length > 0)
+                {
+                    mutations[versions++] = mutant;
+                }
             }
 
-            mutations[0] = inputText;
+            // mutations[0] = inputText;
+            Stopwatch stopwatch = new Stopwatch();
+            stopwatch.Start();
 
-            for (int version = 0; version < mutations.Length; version++)
+
+            SyntaxTree inputTree = CSharpSyntaxTree.ParseText(inputText, options: ParseOptions);
+            SyntaxTree[] inputTrees = { inputTree };
+
+            int localAttempted = 0;
+            int localFailedToCompile = 0;
+            int localFailedToRun = 0;
+
+
+            Parallel.For(0, versions, version =>
             {
                 bool isMutant = true;
-                attempted++;
+                // attempted++;
                 string mutatedText = mutations[version];
 
                 string name = $"{Path.GetFileNameWithoutExtension(testFile)}-{version}";
@@ -328,71 +362,87 @@ Return just the modified programs. Don't include any text in between each progra
 
                 SyntaxTree[] mutatedTrees = { mutatedTree };
 
-                CSharpCompilation debugCompilation = CSharpCompilation.Create(name, mutatedTrees, References, DebugOptions);
-                (ExecutionResult debugResult, string debugstdout, string debugstderr) = CompileAndExecute(debugCompilation, name, isMutant);
+                CSharpCompilation compilation = CSharpCompilation.Create(name, mutatedTrees, References, ReleaseOptions);
+
+                (ExecutionResult debugResult, string debugstdout, string debugstderr) = CompileAndExecute(compilation, name, false, isMutant);
 
                 string debugOutFile = Path.Join(Path.GetDirectoryName(testFile), name + ".debug.out");
                 File.WriteAllText(debugOutFile, $"### EXIT CODE {debugResult.value}\n### STDOUT\n{debugstdout}\n### STDERR\n{debugstderr}");
-                
 
                 if (debugResult.CompileFailed)
                 {
-                    failedToCompile++;
+                    localFailedToCompile++;
                     hadFailures = true;
+                    Console.ForegroundColor = ConsoleColor.Yellow;
                     Console.WriteLine($"*** {name} failed to compile *****");
-                    continue;
+                    Console.ResetColor();
+                    return;
                 }
 
                 if (debugResult.OriginalRunFailed || debugResult.MutantRunFailed)
                 {
-                    failedToRun++;
+                    localFailedToRun++;
                     hadFailures = true;
-                    Console.WriteLine($"*** {name} failed to run *****");
-
-                    continue;
+                    bool hadAssert = debugstderr.Contains("assert", StringComparison.OrdinalIgnoreCase) || debugstdout.Contains("assert", StringComparison.OrdinalIgnoreCase);
+                    Console.ForegroundColor = hadAssert ? ConsoleColor.Red : ConsoleColor.Yellow;
+                    Console.WriteLine($"*** {name} failed to run {(hadAssert ? "ASSERT " : "")}*****");
+                    Console.ResetColor();
+                    return;
                 }
 
                 // Verify debug output is repeatable...
 
-                (ExecutionResult debugResult1, string debugstdout1, string debugstderr1) = CompileAndExecute(debugCompilation, name, isMutant);
+                (ExecutionResult debugResult1, string debugstdout1, string debugstderr1) = CompileAndExecute(compilation, name, false, isMutant);
 
                 string debugOutFile1 = Path.Join(Path.GetDirectoryName(testFile), name + ".debug.out.1");
                 File.WriteAllText(debugOutFile1, $"### EXIT CODE {debugResult.value}\n### STDOUT\n{debugstdout}\n### STDERR\n{debugstderr}");
 
                 if (debugstdout != debugstdout1 || debugstderr != debugstderr1)
                 {
-                    failedToRun++;
+                    localFailedToRun++;
                     hadFailures = true;
-                    Console.WriteLine($"*** {name} debug is non-determinsitic {debugOutFile} and {debugOutFile1} *****");
-                    continue;
+                    Console.ForegroundColor = ConsoleColor.Blue;
+                    Console.WriteLine($"*** {name} debug is non-deterministic");
+                    Console.ResetColor();
+                    return;
                 }
 
-                CSharpCompilation releaseCompilation = CSharpCompilation.Create(name, mutatedTrees, References, ReleaseOptions);
-                (ExecutionResult releaseResult, string releasestdout, string releasestderr) = CompileAndExecute(releaseCompilation, name, isMutant);
+                (ExecutionResult releaseResult, string releasestdout, string releasestderr) = CompileAndExecute(compilation, name, true, isMutant);
 
                 string releaseOutFile = Path.Join(Path.GetDirectoryName(testFile), name + ".release.out");
                 File.WriteAllText(releaseOutFile, $"### EXIT CODE {releaseResult.value}\n### STDOUT\n{releasestdout}\n### STDERR\n{releasestderr}");
 
-                // todo verify same outputs
+                // Verify same outputs
 
                 if (releaseResult.OriginalRunFailed || releaseResult.MutantRunFailed)
                 {
-                    failedToRun++;
+                    localFailedToRun++;
                     hadFailures = true;
-                    Console.WriteLine($"*** {name} debug/release fail difference, compare {debugOutFile} and {releaseOutFile} *****");
-                    continue;
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"*** {name} debug/release fail difference, compare {debugOutFile} {releaseOutFile}");
+                    Console.ResetColor();
+                    return;
                 }
 
                 if (debugstdout != releasestdout || debugstderr != releasestderr)
                 {
-                    failedToRun++;
+                    localFailedToRun++;
                     hadFailures = true;
+                    Console.ForegroundColor = ConsoleColor.Red;
                     Console.WriteLine($"*** {name} debug/release output difference, compare {debugOutFile} and {releaseOutFile} *****");
-                    continue;
+                    Console.ResetColor();
+                    return;
                 }
 
                 Console.WriteLine($"*** {name} debug/release matched");
-            }
+            });
+
+            stopwatch.Stop();
+            Console.WriteLine($"// {testFile} took {stopwatch.ElapsedMilliseconds} ms to process {versions} versions");
+
+            failedToCompile += localFailedToCompile;
+            failedToRun += localFailedToRun;
+            attempted += localAttempted;
 
             if (hadFailures)
             {
@@ -419,17 +469,17 @@ Return just the modified programs. Don't include any text in between each progra
 
                 var deploymentName = "gpt-4.1";
                 //var deploymentName = "o4-mini";
-                var model = "o4-mini";
+                //var model = "o4-mini";
 
                 AzureOpenAIClient azureClient = new(
                     new Uri(endpoint),
                     new AzureKeyCredential(apiKey));
                 ChatClient chatClient = azureClient.GetChatClient(deploymentName);
 
-                //var requestOptions = new ChatCompletionOptions()
-                //{
-                //    Model = model
-                //};
+                var requestOptions = new ChatCompletionOptions()
+                {
+                   // Model = model
+                };
 
                 //requestOptions.
 
@@ -441,7 +491,7 @@ Return just the modified programs. Don't include any text in between each progra
                     new UserChatMessage(prompt)
                 };
 
-                var response = chatClient.CompleteChat(messages);
+                var response = chatClient.CompleteChat(messages, requestOptions);
 
                 stopwatch.Stop();
                 Console.WriteLine($"LLM {deploymentName} query took {stopwatch.ElapsedMilliseconds} ms");
@@ -456,124 +506,120 @@ Return just the modified programs. Don't include any text in between each progra
             }
         }
 
-        private (ExecutionResult, string, string) CompileAndExecute(CSharpCompilation compilation, string name, bool isMutant = false)
+        private (ExecutionResult, string, string) CompileAndExecute(CSharpCompilation compilation, string name, bool optimize, bool isMutant = false)
         {
-            string testAssemblyName = Path.Combine(Path.GetTempPath(), name + ".dll");
-            string testDepsPath = Path.Combine(Path.GetTempPath(), name + ".deps.json");
-            using (var ms = new FileStream(testAssemblyName, FileMode.Create, FileAccess.ReadWrite, FileShare.Read))
-            {
-                EmitResult emitResult;
-                try
-                {
-                    emitResult = compilation.Emit(ms);
-                }
-                catch (Exception ex)
-                {
-                    if (!_quiet)
-                    {
-                        Console.WriteLine($"// Compilation of '{name}' failed: {ex.Message}");
-                    }
-                    return (new ExecutionResult() { kind = isMutant? ExecutionResultKind.MutantCompilationException : ExecutionResultKind.CompilationException }, "", "");
-                }
+            string testAssemblyName = Path.Combine(Path.GetTempPath(), "llm-fuzz", name + ".dll");
 
-                if (!emitResult.Success)
+            if (!File.Exists(testAssemblyName))
+            {
+                //string testDepsPath = Path.Combine(Path.GetTempPath(), name + ".deps.json");
+                using (var ms = new FileStream(testAssemblyName, FileMode.Create, FileAccess.ReadWrite, FileShare.Read))
                 {
+                    EmitResult emitResult;
+                    try
+                    {
+                        emitResult = compilation.Emit(ms);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!_quiet)
+                        {
+                            Console.WriteLine($"// Compilation of '{name}' failed: {ex.Message}");
+                        }
+                        return (new ExecutionResult() { kind = isMutant ? ExecutionResultKind.MutantCompilationException : ExecutionResultKind.CompilationException }, "", "");
+                    }
+
+                    if (!emitResult.Success)
+                    {
+                        if (!_quiet)
+                        {
+                            Console.WriteLine($"// Compilation of '{name}' failed: {emitResult.Diagnostics.Length} errors");
+                            foreach (var d in emitResult.Diagnostics)
+                            {
+                                Console.WriteLine(d);
+                            }
+                        }
+                        return (new ExecutionResult() { kind = isMutant ? ExecutionResultKind.MutantCompilationFailed : ExecutionResultKind.CompilationFailed }, "", "");
+                    }
+
                     if (!_quiet)
                     {
-                        Console.WriteLine($"// Compilation of '{name}' failed: {emitResult.Diagnostics.Length} errors");
-                        foreach (var d in emitResult.Diagnostics)
-                        {
-                            Console.WriteLine(d);
-                        }
+                        Console.WriteLine($"// Compiled '{name}' successfully into {testAssemblyName}");
                     }
-                    return (new ExecutionResult() { kind = isMutant ? ExecutionResultKind.MutantCompilationFailed : ExecutionResultKind.CompilationFailed }, "", "");
+
+                }
+            }
+
+            int result = -1;
+
+            string standardOutput = string.Empty;
+            string standardError = string.Empty;
+
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = Path.Combine(Core_Root, "corerun.exe"),
+                    // Arguments = $"{Path.Combine(Core_Root, "xunit.console.dll")} {testAssemblyName} -nologo -quiet",
+                    Arguments = testAssemblyName,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                };
+
+                if (optimize)
+                {
+                    psi.EnvironmentVariables["DOTNET_TieredCompilation"] = "0";
+                }
+                else
+                {
+                    psi.EnvironmentVariables["DOTNET_JITMinOpts"] = "1";
                 }
 
                 if (!_quiet)
                 {
-                    Console.WriteLine($"// Compiled '{name}' successfully into {testAssemblyName}");
+                    Console.WriteLine($"// Running '{name}' via {psi.FileName} {psi.Arguments} with {psi.EnvironmentVariables}");
                 }
 
-                ms.Close();
-
-                var dependencyContext = new DependencyContext(
-                    new TargetInfo(".NETCoreApp,Version=v10.0", "win10-x64", "win", true),
-                    Microsoft.Extensions.DependencyModel.CompilationOptions.Default,
-                    new CompilationLibrary[] { },
-                    new RuntimeLibrary[] { },
-                    new RuntimeFallbacks[] { }
-                );
-
-                using (var fileStream = new FileStream(testDepsPath, FileMode.Create, FileAccess.Write))
+                // Start the process
+                using (Process process = Process.Start(psi))
                 {
-                    var dependencyContextWriter = new DependencyContextWriter();
-                    dependencyContextWriter.Write(dependencyContext, fileStream);
-                }
+                    // Read the standard output and error
+                    standardOutput = process.StandardOutput.ReadToEnd();
+                    standardError = process.StandardError.ReadToEnd();
 
-
-                int result = -1;
-
-                string standardOutput = string.Empty;
-                string standardError = string.Empty;
-
-                try
-                {
-                    ProcessStartInfo psi = new ProcessStartInfo
-                    {
-                        FileName = Path.Combine(Core_Root, "corerun.exe"),
-                        // Arguments = $"{Path.Combine(Core_Root, "xunit.console.dll")} {testAssemblyName} -nologo -quiet",
-                        Arguments = testAssemblyName,
-                        UseShellExecute = false,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
-                        CreateNoWindow = true,
-                    };
-
-                    psi.EnvironmentVariables["DOTNET_TieredCompilation"] = "0";
+                    // Wait for the process to exit
+                    process.WaitForExit();
 
                     if (!_quiet)
                     {
-                        Console.WriteLine($"// Running '{name}' via {psi.FileName} {psi.Arguments}");
+
+                        // Display the captured output
+                        Console.WriteLine("Standard Output:");
+                        Console.WriteLine(standardOutput);
+
+                        Console.WriteLine("Standard Error:");
+                        Console.WriteLine(standardError);
                     }
 
-                    // Start the process
-                    using (Process process = Process.Start(psi))
+                    result = process.ExitCode;
+
+                    if (result != 0 && result != 100)
                     {
-                        // Read the standard output and error
-                        standardOutput = process.StandardOutput.ReadToEnd();
-                        standardError = process.StandardError.ReadToEnd();
-
-                        // Wait for the process to exit
-                        process.WaitForExit();
-
-                        if (!_quiet)
-                        {
-
-                            // Display the captured output
-                            Console.WriteLine("Standard Output:");
-                            Console.WriteLine(standardOutput);
-
-                            Console.WriteLine("Standard Error:");
-                            Console.WriteLine(standardError);
-                        }
-
-                        result = process.ExitCode;
-
-                        if (result != 0 && result != 100)
-                        {
-                            Console.WriteLine($"// Execution of '{name}' failed (exitCode {result})");
-                            return (new ExecutionResult() { kind = isMutant ? ExecutionResultKind.MutantBadExitCode : ExecutionResultKind.BadExitCode, value = result }, standardOutput, standardError);
-                        }
-
-                        return (new ExecutionResult() { kind = ExecutionResultKind.RanNormally, value=result }, standardOutput, standardError);
+                        Console.WriteLine($"// Execution of '{name}' failed (exitCode {result})");
+                        return (new ExecutionResult() { kind = isMutant ? ExecutionResultKind.MutantBadExitCode : ExecutionResultKind.BadExitCode, value = result }, standardOutput, standardError);
                     }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"// Failed to start process: {ex.Message}");
-                    return (new ExecutionResult() { kind = isMutant ? ExecutionResultKind.MutantThrewException : ExecutionResultKind.ThrewException , value = -1 }, standardOutput, standardError);
+
+                    return (new ExecutionResult() { kind = ExecutionResultKind.RanNormally, value=result }, standardOutput, standardError);
                 }
             }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"// Failed to start process: {ex.Message}");
+                return (new ExecutionResult() { kind = isMutant ? ExecutionResultKind.MutantThrewException : ExecutionResultKind.ThrewException , value = -1 }, standardOutput, standardError);
+            }
         }
+
     }
 }
