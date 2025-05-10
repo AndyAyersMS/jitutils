@@ -342,7 +342,7 @@ Return just the modified programs. Don't include any text in between each progra
             Parallel.For(0, versions, version =>
             {
                 bool isMutant = true;
-                // attempted++;
+                localAttempted++;
                 string mutatedText = mutations[version];
 
                 string name = $"{Path.GetFileNameWithoutExtension(testFile)}-{version}";
@@ -421,6 +421,7 @@ Return just the modified programs. Don't include any text in between each progra
                     Console.ForegroundColor = ConsoleColor.Red;
                     Console.WriteLine($"*** {name} debug/release fail difference, compare {debugOutFile} {releaseOutFile}");
                     Console.ResetColor();
+                    Console.Error.WriteLine($"*** {name} debug/release fail difference, compare {debugOutFile} {releaseOutFile}");
                     return;
                 }
 
@@ -429,8 +430,9 @@ Return just the modified programs. Don't include any text in between each progra
                     localFailedToRun++;
                     hadFailures = true;
                     Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"*** {name} debug/release output difference, compare {debugOutFile} and {releaseOutFile} *****");
+                    Console.WriteLine($"*** {name} debug/release output difference, compare {debugOutFile} {releaseOutFile} *****");
                     Console.ResetColor();
+                    Console.Error.WriteLine($"*** {name} debug/release fail difference, compare {debugOutFile} {releaseOutFile}");
                     return;
                 }
 
@@ -467,9 +469,8 @@ Return just the modified programs. Don't include any text in between each progra
                 var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")
                              ?? throw new InvalidOperationException("Environment variable 'OPENAI_API_KEY' is not set.");
 
-                var deploymentName = "gpt-4.1";
-                //var deploymentName = "o4-mini";
-                //var model = "o4-mini";
+                string deploymentName = "gpt-4.1";
+                //string deploymentName = "o4-mini";
 
                 AzureOpenAIClient azureClient = new(
                     new Uri(endpoint),
