@@ -26,6 +26,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics.X86;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace LLMFuzz
@@ -109,6 +110,13 @@ namespace LLMFuzz
         public static int VersionLimit = 10;
         public static bool Verbose;
 
+        public static int TestParallelism = 1;
+
+        public static int RunParallelism = 1;
+
+        // 100 second time limit on running tests
+        public static int RunTimeout = 100_000;
+
         public static string Core_Root = Environment.GetEnvironmentVariable("CORE_ROOT") ?? throw new InvalidOperationException("Environment variable 'CORE_ROOT' is not set.");
 
         //private static readonly CSharpCompilationOptions DebugOptions =
@@ -149,6 +157,7 @@ namespace LLMFuzz
 
         public int Run()
         {
+            Console.WriteLine($"LLM-Fuzz {DateTime.Now.ToShortTimeString()}");
             int total = 0;
             int skipped = 0;
             int failed = 0;
@@ -177,7 +186,7 @@ namespace LLMFuzz
 
                 Console.WriteLine($"Processing {inputFiles.Count()} files\n");
 
-                Parallel.ForEach(inputFiles, new ParallelOptions() { MaxDegreeOfParallelism = 10 }, subInputFile =>
+                Parallel.ForEach(inputFiles, new ParallelOptions() { MaxDegreeOfParallelism = TestParallelism }, subInputFile =>
                 {
                     // hack to avoid reprocessing earlier outputs
                     if (subInputFile.Contains("-"))
@@ -279,9 +288,10 @@ namespace LLMFuzz
 
             string inputText = File.ReadAllText(testFile);
             string response = QueryLLMForMutation(inputText,
-                @$"Please mutate this code {VersionLimit} times to introduce other C# language features.
-Each mutation should be done to the previous version of the mutated code. Below are the rules for the mutations:
-
+                @$"Please mutate this code {VersionLimit} times.
+Each mutation should be done to original version of the code.
+Below are the rules for the mutations:
+Introduce one or two C# language features in each mutation.
 A loop is clonable if it contains array references and the loop bounds are loop invariant but not constants or the array length,
 or if it includes a virtual or interface call on a variable that is not modified in the loop body.
 Include several examples of clonable loops.
@@ -291,15 +301,19 @@ Include control flow so that some of the loops execute only under certain condit
 Do not use any sources of randomness or non-determinism in the new code.
 Do not use Random or any other source of randomness.
 Do not use nullable.
+Remove [OuterLoop] attributes.
+Do not use DateTime.Now.
+Do not use Marshal.AllocHGlobal.
+Do not use top-level statements.
 Remove any check for AVX512F.VL.
 Add a checksum computation to the code to fingerprint the program behavior. 
 The program must print the checksum value at some points during execution and at the end of the program.
 Ensure that the checksum is not zero if the execution is successful and changes as the program progresses.
-Rename any method with a [Fact] attribute to be the main entry point of a console application. 
-The entry point must be a public static void method called Main that takes no arguments.
+The entry point of a console application is a public static void method called Main that takes no arguments.
+Rename any method with a [Fact] attribute to be the entry point of a console application. 
 If there are multiple methods with [Fact] attributes just choose one as the main method.
 Do not modify the return code of the main method.
-
+Use ```csharp to delimit the different mutations.
 Return just the modified programs. Don't include any text in between each program in your response.");
 
             if (response == null)
@@ -338,8 +352,8 @@ Return just the modified programs. Don't include any text in between each progra
             int localFailedToCompile = 0;
             int localFailedToRun = 0;
 
-
-            Parallel.For(0, versions, version =>
+            CancellationTokenSource cts = new CancellationTokenSource(RunTimeout);
+            Parallel.For(0, versions, new ParallelOptions() { MaxDegreeOfParallelism = RunParallelism, CancellationToken = cts.Token }, version =>
             {
                 bool isMutant = true;
                 localAttempted++;
@@ -469,8 +483,8 @@ Return just the modified programs. Don't include any text in between each progra
                 var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")
                              ?? throw new InvalidOperationException("Environment variable 'OPENAI_API_KEY' is not set.");
 
-                string deploymentName = "gpt-4.1";
-                //string deploymentName = "o4-mini";
+                // string deploymentName = "gpt-4.1";
+                string deploymentName = "o3-mini";
 
                 AzureOpenAIClient azureClient = new(
                     new Uri(endpoint),
