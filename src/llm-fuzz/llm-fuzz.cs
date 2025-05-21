@@ -4,28 +4,15 @@
 
 using Azure;
 using Azure.AI.OpenAI;
-using Azure.Core;
-using Microsoft.Build.ObjectModelRemoting;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Emit;
-using Microsoft.CodeAnalysis.MSBuild;
-using Microsoft.Extensions.DependencyModel;
-using Microsoft.Extensions.DependencyModel.Resolution;
 using OpenAI.Chat;
 using System;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.Diagnostics;
-using System.Dynamic;
 using System.IO;
 using System.Linq;
-using System.Net.Http;
-using System.Net.Http.Headers;
-using System.Runtime.CompilerServices;
-using System.Runtime.Intrinsics.X86;
-using System.Text;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -110,9 +97,13 @@ namespace LLMFuzz
         public static int VersionLimit = 10;
         public static bool Verbose;
 
-        public static int TestParallelism = 1;
+        public static int TestParallelism = 20;
 
-        public static int RunParallelism = 1;
+        public static int TestRepeat = 3;
+
+        public static int RetryCount = 5;
+
+        public static int RunParallelism = Environment.ProcessorCount;
 
         // 100 second time limit on running tests
         public static int RunTimeout = 100_000;
@@ -139,25 +130,22 @@ namespace LLMFuzz
             MetadataReference.CreateFromFile(Path.Combine(Core_Root, "xunit.core.dll"))
         };
 
-        public Random _random;
         private bool _quiet;
 
         public static void Main(string[] args)
         {
             var p = new Program();
-            p._random = new Random(42);
             p._quiet = true;
-
             SizeLimit = 10000;
             TimeLimit = 10000;
             Verbose = true;
-
             p.Run();
         }
 
         public int Run()
         {
             Console.WriteLine($"LLM-Fuzz {DateTime.Now.ToShortTimeString()}");
+            Console.Error.WriteLine($"LLM-Fuzz {DateTime.Now.ToShortTimeString()}");
             int total = 0;
             int skipped = 0;
             int failed = 0;
@@ -181,20 +169,24 @@ namespace LLMFuzz
             if (recursive)
             {
                 string suffix = ".cs";
+                // exclude -- as indicator of prior fuzzing output
                 var inputFiles = Directory.EnumerateFiles(inputFilePath, "*", SearchOption.AllDirectories)
-                                    .Where(s => (s.EndsWith(suffix)));
+                                    .Where(s => (s.EndsWith(suffix) && !s.Contains("--")));
 
-                Console.WriteLine($"Processing {inputFiles.Count()} files\n");
+                int inputFileCount = inputFiles.Count();
+                int notifyInterval = inputFileCount / 500;
+                int notifyValue = notifyInterval;
+
+                Console.WriteLine($"Processing {inputFileCount} files\n");
+                Console.Error.WriteLine($"Processing {inputFileCount} files\n");
 
                 Parallel.ForEach(inputFiles, new ParallelOptions() { MaxDegreeOfParallelism = TestParallelism }, subInputFile =>
                 {
-                    // hack to avoid reprocessing earlier outputs
-                    if (subInputFile.Contains("-"))
+                    // Avoid reprocessing earlier outputs
+                    if (subInputFile.Contains("--"))
                     {
-                        skipped++;
                         return;
                     }
-                    total++;
 
                     Console.WriteLine($"\n// *** LLM-Fuzz {subInputFile} {DateTime.Now.ToShortTimeString()} ***");
 
@@ -202,37 +194,29 @@ namespace LLMFuzz
                     int subVariantFailedToCompile = 0;
                     int subVariantFailedToRun = 0;
 
-                    ExecutionResult result = MutateOneTestFile(subInputFile, ref subVariantTotal, ref subVariantFailedToCompile, ref subVariantFailedToRun);
-
-                    if (result.Success)
+                    for (int i = 0; i < TestRepeat; i++)
                     {
-                        succeeded++;
-                    }
-                    else
-                    {
-                        if (result.OriginalCompileFailed || result.OriginalRunFailed || result.NoMutationsAttempted)
-                        {
-                            skipped++;
-                        }
-                        else
-                        {
-                            if (subVariantFailedToRun > 0)
-                            {
-                                failed++;
-                            }
-
-                            if (subVariantFailedToRun > 0)
-                            {
-                                int successes = subVariantTotal - subVariantFailedToCompile - subVariantFailedToRun;
-                                Console.WriteLine($"// {subInputFile}: {subVariantTotal} variants, {successes} passed" +
-                                    $" [{subVariantFailedToCompile} did not compile, {subVariantFailedToRun} did not run correctly]");
-                            }
-                        }
+                        ExecutionResult result = MutateOneTestFile(subInputFile, i, ref subVariantTotal, ref subVariantFailedToCompile, ref subVariantFailedToRun);
                     }
 
-                    variantTotal += subVariantTotal;
-                    variantFailedToCompile += subVariantFailedToCompile;
-                    variantFailedToRun += subVariantFailedToRun;
+                    Interlocked.Add(ref variantTotal, subVariantTotal);
+                    Interlocked.Add(ref variantFailedToCompile, subVariantFailedToCompile);
+                    Interlocked.Add(ref variantFailedToRun, subVariantFailedToRun);
+
+                    int successes = subVariantTotal - subVariantFailedToCompile - subVariantFailedToRun;
+
+                    Console.ForegroundColor = skipped + failed == 0 ? ConsoleColor.Green : ConsoleColor.DarkYellow;
+                    Console.WriteLine($"// {subInputFile}: {subVariantTotal} variants, {successes} passed" +
+                        $" [{subVariantFailedToCompile} did not compile, {subVariantFailedToRun} did not run");
+                    Console.ResetColor();
+
+                    int newTotal = Interlocked.Increment(ref total);
+
+                    if (newTotal >= notifyValue)
+                    {
+                        Console.Error.WriteLine($"*** {DateTime.Now.ToShortTimeString()} Processed {total}/{inputFileCount} files (x{TestRepeat * RetryCount}); {variantTotal} variants, {variantFailedToCompile} did not compile, {variantFailedToRun} did not run.");
+                        notifyValue += notifyInterval;
+                    }
                 });
 
                 Console.WriteLine($"Final Results: {total} files, {succeeded} succeeded, {skipped} skipped, {failed} failed");
@@ -251,7 +235,7 @@ namespace LLMFuzz
             {
                 Console.WriteLine($"\n// *** LLM-Fuzz {inputFilePath} {DateTime.Now.ToShortTimeString} ***");
 
-                ExecutionResult result = MutateOneTestFile(inputFilePath, ref variantTotal, ref variantFailedToCompile, ref variantFailedToRun);
+                ExecutionResult result = MutateOneTestFile(inputFilePath, 0, ref variantTotal, ref variantFailedToCompile, ref variantFailedToRun);
 
                 if (result.Success)
                 {
@@ -276,7 +260,7 @@ namespace LLMFuzz
             }
         }
 
-        private ExecutionResult MutateOneTestFile(string testFile, ref int attempted, ref int failedToCompile, ref int failedToRun)
+        private ExecutionResult MutateOneTestFile(string testFile, int versionBase, ref int attempted, ref int failedToCompile, ref int failedToRun)
         {
             // Access input and build parse tree
             if (!File.Exists(testFile))
@@ -287,34 +271,55 @@ namespace LLMFuzz
             bool hadFailures = false;
 
             string inputText = File.ReadAllText(testFile);
-            string response = QueryLLMForMutation(inputText,
+            string response = QueryLLMForMutation(versionBase, inputText,
                 @$"Please mutate this code {VersionLimit} times.
 Each mutation should be done to original version of the code.
-Below are the rules for the mutations:
+
+Here are the rules for the mutations.
+
 Introduce one or two C# language features in each mutation.
+
 A loop is clonable if it contains array references and the loop bounds are loop invariant but not constants or the array length,
 or if it includes a virtual or interface call on a variable that is not modified in the loop body.
 Include several examples of clonable loops.
 Try and reuse the same arrays in multiple loops.
-Make sure to add appropriate using statements for any newly added types. 
 Include control flow so that some of the loops execute only under certain conditions.
+
+An object is stack allocatable if it is created by `new` a method and
+ - is not passed to a non-inlined method or 
+ - is not assigned to a field or property of another object 
+ - is not assigned to a static field
+ - is not returned
+Every so often create code to stack allocatable objects and use those objects in the new loops and control flow.
+
+Make sure to add appropriate using statements for any newly added types. 
+
 Do not use any sources of randomness or non-determinism in the new code.
 Do not use Random or any other source of randomness.
 Do not use nullable.
+Remove `using Xunit;`
 Remove [OuterLoop] attributes.
 Do not use DateTime.Now.
 Do not use Marshal.AllocHGlobal.
 Do not use top-level statements.
+Do not use stopwatch.
+Do not create classes with finalizers.
 Remove any check for AVX512F.VL.
+
 Add a checksum computation to the code to fingerprint the program behavior. 
 The program must print the checksum value at some points during execution and at the end of the program.
 Ensure that the checksum is not zero if the execution is successful and changes as the program progresses.
+
 The entry point of a console application is a public static void method called Main that takes no arguments.
 Rename any method with a [Fact] attribute to be the entry point of a console application. 
 If there are multiple methods with [Fact] attributes just choose one as the main method.
 Do not modify the return code of the main method.
+
 Use ```csharp to delimit the different mutations.
-Return just the modified programs. Don't include any text in between each program in your response.");
+
+Respond with only the {VersionLimit} mutated programs. 
+The response must only include C# code and the ```csharp delimiter.
+Do not add any other text to your response.");
 
             if (response == null)
             {
@@ -353,105 +358,164 @@ Return just the modified programs. Don't include any text in between each progra
             int localFailedToRun = 0;
 
             CancellationTokenSource cts = new CancellationTokenSource(RunTimeout);
-            Parallel.For(0, versions, new ParallelOptions() { MaxDegreeOfParallelism = RunParallelism, CancellationToken = cts.Token }, version =>
+            List<Process> processes = new List<Process>();
+
+            void CleanupProcesses()
             {
-                bool isMutant = true;
-                localAttempted++;
-                string mutatedText = mutations[version];
-
-                string name = $"{Path.GetFileNameWithoutExtension(testFile)}-{version}";
-                string mutantFile = Path.Join(Path.GetDirectoryName(testFile), name + ".cs");
-
-                if (!_quiet)
+                foreach (var process in processes)
                 {
-                    Console.WriteLine($"\n\n*** Version {version}: {name} *****");
-                    Console.WriteLine(mutatedText);
+                    try
+                    {
+                        process.Kill();
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error killing process: {ex.Message}");
+                    }
                 }
+            }
 
-                File.WriteAllText(mutantFile, mutatedText);
-
-                SyntaxTree mutatedTree = CSharpSyntaxTree.ParseText(mutatedText,
-                        path: version == 0 ? testFile : $"{name}.cs",
-                        options: ParseOptions);
-
-                SyntaxTree[] mutatedTrees = { mutatedTree };
-
-                CSharpCompilation compilation = CSharpCompilation.Create(name, mutatedTrees, References, ReleaseOptions);
-
-                (ExecutionResult debugResult, string debugstdout, string debugstderr) = CompileAndExecute(compilation, name, false, isMutant);
-
-                string debugOutFile = Path.Join(Path.GetDirectoryName(testFile), name + ".debug.out");
-                File.WriteAllText(debugOutFile, $"### EXIT CODE {debugResult.value}\n### STDOUT\n{debugstdout}\n### STDERR\n{debugstderr}");
-
-                if (debugResult.CompileFailed)
+            try
+            {
+                Parallel.For(0, versions, new ParallelOptions() { MaxDegreeOfParallelism = RunParallelism, CancellationToken = cts.Token }, version =>
                 {
-                    localFailedToCompile++;
-                    hadFailures = true;
-                    Console.ForegroundColor = ConsoleColor.Yellow;
-                    Console.WriteLine($"*** {name} failed to compile *****");
-                    Console.ResetColor();
-                    return;
-                }
+                    bool isMutant = true;
+                    localAttempted++;
+                    string mutatedText = mutations[version];
 
-                if (debugResult.OriginalRunFailed || debugResult.MutantRunFailed)
-                {
-                    localFailedToRun++;
-                    hadFailures = true;
-                    bool hadAssert = debugstderr.Contains("assert", StringComparison.OrdinalIgnoreCase) || debugstdout.Contains("assert", StringComparison.OrdinalIgnoreCase);
-                    Console.ForegroundColor = hadAssert ? ConsoleColor.Red : ConsoleColor.Yellow;
-                    Console.WriteLine($"*** {name} failed to run {(hadAssert ? "ASSERT " : "")}*****");
-                    Console.ResetColor();
-                    return;
-                }
+                    string name = $"{Path.GetFileNameWithoutExtension(testFile)}--{versionBase}--{version}";
+                    string mutantFile = Path.Join(Path.GetDirectoryName(testFile), name + ".cs");
 
-                // Verify debug output is repeatable...
+                    if (!_quiet)
+                    {
+                        Console.WriteLine($"\n\n*** Version {version}: {name} *****");
+                        Console.WriteLine(mutatedText);
+                    }
 
-                (ExecutionResult debugResult1, string debugstdout1, string debugstderr1) = CompileAndExecute(compilation, name, false, isMutant);
+                    File.WriteAllText(mutantFile, mutatedText);
 
-                string debugOutFile1 = Path.Join(Path.GetDirectoryName(testFile), name + ".debug.out.1");
-                File.WriteAllText(debugOutFile1, $"### EXIT CODE {debugResult.value}\n### STDOUT\n{debugstdout}\n### STDERR\n{debugstderr}");
+                    SyntaxTree mutatedTree = CSharpSyntaxTree.ParseText(mutatedText,
+                            path: version == 0 ? testFile : $"{name}.cs",
+                            options: ParseOptions);
 
-                if (debugstdout != debugstdout1 || debugstderr != debugstderr1)
-                {
-                    localFailedToRun++;
-                    hadFailures = true;
-                    Console.ForegroundColor = ConsoleColor.Blue;
-                    Console.WriteLine($"*** {name} debug is non-deterministic");
-                    Console.ResetColor();
-                    return;
-                }
+                    SyntaxTree[] mutatedTrees = { mutatedTree };
 
-                (ExecutionResult releaseResult, string releasestdout, string releasestderr) = CompileAndExecute(compilation, name, true, isMutant);
+                    CSharpCompilation compilation = CSharpCompilation.Create(name, mutatedTrees, References, ReleaseOptions);
 
-                string releaseOutFile = Path.Join(Path.GetDirectoryName(testFile), name + ".release.out");
-                File.WriteAllText(releaseOutFile, $"### EXIT CODE {releaseResult.value}\n### STDOUT\n{releasestdout}\n### STDERR\n{releasestderr}");
+                    (ExecutionResult debugResult, string debugstdout, string debugstderr) = CompileAndExecute(processes, compilation, name, false, isMutant);
 
-                // Verify same outputs
+                    string debugOutFile = Path.Join(Path.GetDirectoryName(testFile), name + ".debug.out");
+                    File.WriteAllText(debugOutFile, $"### EXIT CODE {debugResult.value}\n### STDOUT\n{debugstdout}\n### STDERR\n{debugstderr}");
 
-                if (releaseResult.OriginalRunFailed || releaseResult.MutantRunFailed)
-                {
-                    localFailedToRun++;
-                    hadFailures = true;
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"*** {name} debug/release fail difference, compare {debugOutFile} {releaseOutFile}");
-                    Console.ResetColor();
-                    Console.Error.WriteLine($"*** {name} debug/release fail difference, compare {debugOutFile} {releaseOutFile}");
-                    return;
-                }
+                    if (debugResult.CompileFailed)
+                    {
+                        localFailedToCompile++;
+                        hadFailures = true;
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                        Console.WriteLine($"*** {name} failed to compile *****");
+                        Console.ResetColor();
+                        return;
+                    }
 
-                if (debugstdout != releasestdout || debugstderr != releasestderr)
-                {
-                    localFailedToRun++;
-                    hadFailures = true;
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"*** {name} debug/release output difference, compare {debugOutFile} {releaseOutFile} *****");
-                    Console.ResetColor();
-                    Console.Error.WriteLine($"*** {name} debug/release fail difference, compare {debugOutFile} {releaseOutFile}");
-                    return;
-                }
+                    if (debugResult.OriginalRunFailed || debugResult.MutantRunFailed)
+                    {
+                        localFailedToRun++;
+                        hadFailures = true;
+                        bool debugAssert = debugstderr.Contains("assert", StringComparison.OrdinalIgnoreCase) || debugstdout.Contains("assert", StringComparison.OrdinalIgnoreCase);
+                        Console.ForegroundColor = debugAssert ? ConsoleColor.Red : ConsoleColor.Yellow;
+                        Console.WriteLine($"*** {name} failed to run {(debugAssert ? "debug run ASSERT " : "")}*****");
+                        Console.ResetColor();
+                        return;
+                    }
 
-                Console.WriteLine($"*** {name} debug/release matched");
-            });
+                    // Verify debug output is repeatable... (just once)
+
+                    (ExecutionResult debugResult1, string debugstdout1, string debugstderr1) = CompileAndExecute(processes, compilation, name, false, isMutant);
+
+                    string debugOutFile1 = Path.Join(Path.GetDirectoryName(testFile), name + ".debug.out.1");
+                    File.WriteAllText(debugOutFile1, $"### EXIT CODE {debugResult.value}\n### STDOUT\n{debugstdout}\n### STDERR\n{debugstderr}");
+
+                    if (debugstdout != debugstdout1 || debugstderr != debugstderr1)
+                    {
+                        localFailedToRun++;
+                        hadFailures = true;
+                        Console.ForegroundColor = ConsoleColor.Blue;
+                        Console.WriteLine($"*** {name} debug is non-deterministic");
+                        Console.ResetColor();
+                        return;
+                    }
+
+                    // Run with opts enabled
+
+                    (ExecutionResult releaseResult, string releasestdout, string releasestderr) = CompileAndExecute(processes, compilation, name, true, isMutant);
+
+                    string releaseOutFile = Path.Join(Path.GetDirectoryName(testFile), name + ".release.out");
+                    File.WriteAllText(releaseOutFile, $"### EXIT CODE {releaseResult.value}\n### STDOUT\n{releasestdout}\n### STDERR\n{releasestderr}");
+
+                    bool hadAssert = releasestdout.Contains("assert", StringComparison.OrdinalIgnoreCase) || releasestderr.Contains("assert", StringComparison.OrdinalIgnoreCase);
+
+                    // Verify same outputs in debug and release
+
+                    if (releaseResult.OriginalRunFailed || releaseResult.MutantRunFailed)
+                    {
+                        localFailedToRun++;
+                        hadFailures = true;
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine($"*** {name} debug/release fail difference, compare {debugOutFile} {releaseOutFile}");
+                        Console.ResetColor();
+                        Console.Error.WriteLine($"*** {name} debug/release fail difference, compare {debugOutFile} {releaseOutFile}");
+                        return;
+                    }
+
+                    if (debugstdout != releasestdout || debugstderr != releasestderr)
+                    {
+                        // Validate that debug really is deterministic by running it more times
+
+                        if (!hadAssert)
+                        {
+                            for (int retry = 0; retry < RetryCount; retry++)
+                            {
+                                (ExecutionResult retryResult, string retryStdout, string retryStderr) = CompileAndExecute(processes, compilation, name, true, isMutant);
+
+                                if (debugstdout != retryStdout || debugstderr != retryStderr)
+                                {
+                                    localFailedToRun++;
+                                    hadFailures = true;
+                                    Console.ForegroundColor = ConsoleColor.Blue;
+                                    Console.WriteLine($"*** {name} debug is non-deterministic (extended retry)");
+                                    Console.ResetColor();
+                                    return;
+                                }
+                            }
+                        }
+
+
+                        localFailedToRun++;
+                        hadFailures = true;
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine($"*** {name} debug/release output difference, {(hadAssert ? "release run ASSERT, " : "")}compare {debugOutFile} {releaseOutFile} *****");
+                        Console.ResetColor();
+                        Console.Error.WriteLine($"*** {name} debug/release fail difference, {(hadAssert ? "release run ASSERT " : "")} compare {debugOutFile} {releaseOutFile}");
+                        return;
+                    }
+
+                    Console.WriteLine($"*** {name} debug/release matched");
+                });
+            }
+            catch (OperationCanceledException)
+            {
+                Console.WriteLine($"*** {testFile} timed out after {RunTimeout} ms");
+                return new ExecutionResult() { kind = ExecutionResultKind.RanTooLong, value = RunTimeout };
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"*** {testFile} failed: {ex.Message}");
+                return new ExecutionResult() { kind = ExecutionResultKind.BadLLMResponse };
+            }
+            finally
+            {
+                CleanupProcesses();
+            }
 
             stopwatch.Stop();
             Console.WriteLine($"// {testFile} took {stopwatch.ElapsedMilliseconds} ms to process {versions} versions");
@@ -465,12 +529,12 @@ Return just the modified programs. Don't include any text in between each progra
                 return new ExecutionResult() { kind = ExecutionResultKind.HadFailures };
             }
             else
-            { 
+            {
                 return new ExecutionResult() { kind = ExecutionResultKind.RanNormally };
             }
         }
-        
-        private string QueryLLMForMutation(string inputCode, string prompt)
+
+        private string QueryLLMForMutation(int versionBase, string inputCode, string prompt)
         {
             try
             {
@@ -483,8 +547,7 @@ Return just the modified programs. Don't include any text in between each progra
                 var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")
                              ?? throw new InvalidOperationException("Environment variable 'OPENAI_API_KEY' is not set.");
 
-                // string deploymentName = "gpt-4.1";
-                string deploymentName = "o3-mini";
+                string deploymentName = (versionBase % 3) switch { 0 => "phi-4", 1 => "o3-mini", 2 => "gpt-4.1" };
 
                 AzureOpenAIClient azureClient = new(
                     new Uri(endpoint),
@@ -493,7 +556,7 @@ Return just the modified programs. Don't include any text in between each progra
 
                 var requestOptions = new ChatCompletionOptions()
                 {
-                   // Model = model
+                    // Model = model
                 };
 
                 //requestOptions.
@@ -521,7 +584,7 @@ Return just the modified programs. Don't include any text in between each progra
             }
         }
 
-        private (ExecutionResult, string, string) CompileAndExecute(CSharpCompilation compilation, string name, bool optimize, bool isMutant = false)
+        private (ExecutionResult, string, string) CompileAndExecute(List<Process> processes, CSharpCompilation compilation, string name, bool optimize, bool isMutant = false)
         {
             string testAssemblyName = Path.Combine(Path.GetTempPath(), "llm-fuzz", name + ".dll");
 
@@ -600,6 +663,11 @@ Return just the modified programs. Don't include any text in between each progra
                 // Start the process
                 using (Process process = Process.Start(psi))
                 {
+                    lock (processes)
+                    {
+                        processes.Add(process);
+                    }
+
                     // Read the standard output and error
                     standardOutput = process.StandardOutput.ReadToEnd();
                     standardError = process.StandardError.ReadToEnd();
@@ -626,13 +694,13 @@ Return just the modified programs. Don't include any text in between each progra
                         return (new ExecutionResult() { kind = isMutant ? ExecutionResultKind.MutantBadExitCode : ExecutionResultKind.BadExitCode, value = result }, standardOutput, standardError);
                     }
 
-                    return (new ExecutionResult() { kind = ExecutionResultKind.RanNormally, value=result }, standardOutput, standardError);
+                    return (new ExecutionResult() { kind = ExecutionResultKind.RanNormally, value = result }, standardOutput, standardError);
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"// Failed to start process: {ex.Message}");
-                return (new ExecutionResult() { kind = isMutant ? ExecutionResultKind.MutantThrewException : ExecutionResultKind.ThrewException , value = -1 }, standardOutput, standardError);
+                return (new ExecutionResult() { kind = isMutant ? ExecutionResultKind.MutantThrewException : ExecutionResultKind.ThrewException, value = -1 }, standardOutput, standardError);
             }
         }
 
