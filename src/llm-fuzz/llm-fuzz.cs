@@ -366,11 +366,14 @@ Do not add any other text to your response.");
                 {
                     try
                     {
-                        process.Kill();
+                        if (!process.HasExited)
+                        {
+                            process.Close();
+                        }
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"Error killing process: {ex.Message}");
+                        // Console.WriteLine($"Error closing process: {ex.Message}");
                     }
                 }
             }
