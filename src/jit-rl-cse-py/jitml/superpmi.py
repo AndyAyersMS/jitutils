@@ -69,7 +69,12 @@ class SuperPmi:
             raise FileNotFoundError(f"jit {self.jit_path} does not exist.")
 
     def __del__(self):
-        self.stop()
+        # Guard against partially-initialized instances (e.g. tests that use
+        # SuperPmi.__new__ to bypass the constructor) so __del__ never raises.
+        try:
+            self.stop()
+        except AttributeError:
+            pass
 
     def __enter__(self):
         self.start()
@@ -169,30 +174,58 @@ class SuperPmi:
                     process.kill()
                     process.wait()
 
+    # Compiled regexes shared across parses in streaming mode.
+    _RE_INDEX             = re.compile(r'spmi index (\d+)')
+    _RE_NAME              = re.compile(r'for method ([^ ]+):')
+    _RE_HASH              = re.compile(r'MethodHash=([0-9a-f]+)')
+    _RE_TOTAL_BYTES       = re.compile(r'Total bytes of code (\d+)')
+    _RE_PROLOG_SIZE       = re.compile(r'prolog size (\d+)')
+    _RE_INSTR_COUNT       = re.compile(r'instruction count (\d+)')
+    _RE_PERF_SCORE        = re.compile(r'PerfScore ([0-9.]+)')
+    _RE_BYTES_ALLOCATED   = re.compile(r'allocated bytes for code (\d+)')
+    _RE_NUM_CSE           = re.compile(r'num cse (\d+)')
+    _RE_NUM_CAND          = re.compile(r'num cand (\d+)')
+    # Everything after "num cand N ": may contain a heuristic name, then
+    # optional " featureNames ...", " features #<idx>,...", " seq n,n,...",
+    # and always ends with " spmi index N (MethodHash=...) for method ...".
+    _RE_POST_NUM_CAND     = re.compile(r'num cand \d+(.*)$')
+    _RE_SEQ               = re.compile(r'seq ([0-9,]+)(?= spmi index )')
+    _RE_FEATURE_CANDIDATE = re.compile(r'features #([0-9,]+)')
+    _RE_FEATURE_NAMES     = re.compile(r'featureNames ([^ ]+)')
+
+    # Tail markers, in order they may appear after the heuristic name.
+    _POST_NUM_CAND_TAIL_MARKERS = (
+        ' featureNames ',
+        ' features #',
+        ' seq ',
+        ' spmi index ',
+    )
+
     def _parse_method_context(self, line:str) -> MethodContext:
+        # Discover the feature names header the first time we see it.
         if self._feature_names is None:
-            # find featureNames in line
-            feature_names_header = 'featureNames '
-            start = line.find(feature_names_header)
-            stop = line.find(' ', start + len(feature_names_header))
-            if start > 0:
-                self._feature_names = line[start + len(feature_names_header):stop].split(',')
+            fn_match = self._RE_FEATURE_NAMES.search(line)
+            if fn_match is not None:
+                self._feature_names = fn_match.group(1).split(',')
+                # Slot 0 in the `features #idx,...` payload is the CSE index
+                # (dumped as %i after the '#'). Prepend a sentinel so
+                # positional slots line up with `_feature_names`.
                 self._feature_names.insert(0, 'id')
 
         properties = {}
-        properties['index'] = int(re.search(r'spmi index (\d+)', line).group(1))
-        properties['name'] = re.search(r'for method ([^ ]+):', line).group(1)
-        properties['hash'] = re.search(r'MethodHash=([0-9a-f]+)', line).group(1)
-        properties['total_bytes'] = int(re.search(r'Total bytes of code (\d+)', line).group(1))
-        properties['prolog_size'] = int(re.search(r'prolog size (\d+)', line).group(1))
-        properties['instruction_count'] = int(re.search(r'instruction count (\d+)', line).group(1))
-        properties['perf_score'] = float(re.search(r'PerfScore ([0-9.]+)', line).group(1))
-        properties['bytes_allocated'] = int(re.search(r'allocated bytes for code (\d+)', line).group(1))
-        properties['num_cse'] = int(re.search(r'num cse (\d+)', line).group(1))
-        properties['num_cse_candidate'] = int(re.search(r'num cand (\d+)', line).group(1))
-        properties['heuristic'] = re.search(r'num cand \d+ (.+) ', line).group(1)
+        properties['index']             = int(self._RE_INDEX.search(line).group(1))
+        properties['name']              = self._RE_NAME.search(line).group(1)
+        properties['hash']              = self._RE_HASH.search(line).group(1)
+        properties['total_bytes']       = int(self._RE_TOTAL_BYTES.search(line).group(1))
+        properties['prolog_size']       = int(self._RE_PROLOG_SIZE.search(line).group(1))
+        properties['instruction_count'] = int(self._RE_INSTR_COUNT.search(line).group(1))
+        properties['perf_score']        = float(self._RE_PERF_SCORE.search(line).group(1))
+        properties['bytes_allocated']   = int(self._RE_BYTES_ALLOCATED.search(line).group(1))
+        properties['num_cse']           = int(self._RE_NUM_CSE.search(line).group(1))
+        properties['num_cse_candidate'] = int(self._RE_NUM_CAND.search(line).group(1))
+        properties['heuristic']         = self._extract_heuristic_name(line)
 
-        seq = re.search(r'seq ([0-9,]+) spmi', line)
+        seq = self._RE_SEQ.search(line)
         if seq is not None:
             properties['cses_chosen'] = [int(x) for x in seq.group(1).split(',')]
         else:
@@ -200,9 +233,9 @@ class SuperPmi:
 
         cse_candidates = None
         if self._feature_names is not None:
-            # features CSE #032,3,10,3,3,150,150,1,1,0,0,0,0,0,0,37
-            candidates = re.findall(r'features #([0-9,]+)', line)
-            if candidates is not None:
+            # e.g. `features #032,3,10,3,3,150,150,1,1,0,0,0,0,0,0,37`
+            candidates = self._RE_FEATURE_CANDIDATE.findall(line)
+            if candidates:
                 cse_candidates = [{self._feature_names[i]: int(x) for i, x in enumerate(candidate.split(','))}
                                   for candidate in candidates]
 
@@ -214,6 +247,25 @@ class SuperPmi:
         properties['cse_candidates'] = cse_candidates if cse_candidates is not None else []
 
         return MethodContext(**properties)
+
+    @classmethod
+    def _extract_heuristic_name(cls, line: str) -> str:
+        """Extract the heuristic-name blob emitted between ``num cand N`` and the
+        first known trailing marker (featureNames / features / seq / spmi index).
+
+        When ``JitRLHook=1`` is active, ``CSE_HeuristicRLHook::DumpMetrics`` does
+        not emit the heuristic name, so this returns the empty string. When a
+        classic heuristic is active, this returns a value like
+        ``"Aggressive CSE Heuristic"`` or ``"Standard CSE Heuristic"``.
+        """
+        match = cls._RE_POST_NUM_CAND.search(line)
+        if match is None:
+            return ""
+
+        rest = match.group(1)
+        positions = [rest.find(marker) for marker in cls._POST_NUM_CAND_TAIL_MARKERS if marker in rest]
+        cutoff = min(positions) if positions else len(rest)
+        return rest[:cutoff].strip()
 
     def start(self):
         """Starts and returns the superpmi process."""

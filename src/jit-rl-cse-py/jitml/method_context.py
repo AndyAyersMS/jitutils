@@ -69,9 +69,10 @@ class MethodContext(BaseModel):
     bytes_allocated : int
     num_cse : int
     num_cse_candidate : int
-    heuristic : str
-    cses_chosen : List[int]
-    cse_candidates : List[CseCandidate]
+    # Optional: not emitted by CSE_HeuristicRLHook::DumpMetrics.
+    heuristic : str = ""
+    cses_chosen : List[int] = []
+    cse_candidates : List[CseCandidate] = []
 
     def __str__(self):
         return f"{self.index}: {self.name}"
