@@ -1,36 +1,83 @@
-# Introduction
+# jit-rl-cse-py
 
-This project is a Reinforcement Learning gymnasium used to train a machine learning model to choose when to apply the Common Subexpression Elimination optimization in the JIT.
+A Reinforcement Learning gymnasium used to train a machine learning model
+to drive the JIT's Common Subexpression Elimination (CSE) heuristic. It is
+the Python-based revival of the older C# [MLCSE](../jit-rl-cse/README.md)
+experiment, using [Stable-Baselines3](https://stable-baselines3.readthedocs.io/)
+(PPO/A2C/DQN) as the RL package instead of a hand-crafted policy-gradient
+implementation.
 
-Currently, it *almost* matches the default, hand-written CSE heuristic in the JIT, and does so with a simple reward function and features which are not normalized or smartly chosen.  This is intended to be a playground to try to find optimal features, reward function, neural network, and architecture for a fine-tuned CSE model.
+The environment drives the JIT via the generic
+[`CSE_HeuristicRLHook`](https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/optcse.cpp)
+(`JitRLHook=1`), so it is not tied to any particular policy shape. Method
+JITting is done in-process via `superpmi -streaming=stdin` for high
+throughput.
 
-This project works best/easiest on Ubuntu 22 (WSL2 is fine), but it also works on Windows.
+**Status:** Under active revival. The initial import matches
+[`leculver/jitml`](https://github.com/leculver/jitml) at commit
+[`847191a`](https://github.com/leculver/jitml/commit/847191a) (Jun 2024).
+See [PLAN](#status--roadmap) below for what's coming next. Original
+authorship: Lee Culver (@leculver).
 
-# Setup
+## Provenance
 
-Follow the standard [Workflow Guide](https://github.com/dotnet/runtime/blob/main/docs/workflow/README.md) to get a working environment to build .Net.
+This subtree was imported from [`leculver/jitml`](https://github.com/leculver/jitml)
+via `git subtree add --prefix=src/jit-rl-cse-py`. Original commit hashes are
+preserved in `git log --follow` output for files under this directory.
 
-## Runtime setup
+That project was itself extracted from `src/coreclr/scripts/cse_ml/` in
+[dotnet/runtime](https://github.com/dotnet/runtime), removed by
+[dotnet/runtime#102270](https://github.com/dotnet/runtime/pull/102270).
 
-Build a checked version of the runtime and tests:
+## Requirements
+
+- Windows or Linux (Ubuntu 22.04 / WSL2 recommended).
+- Python 3.10 – 3.12. Python 3.13 is not yet officially supported by
+  Stable-Baselines3.
+- A local clone + Checked build of
+  [dotnet/runtime](https://github.com/dotnet/runtime).
+
+## Setup
+
+### 1. Runtime setup
+
+Follow the [dotnet/runtime workflow guide](https://github.com/dotnet/runtime/blob/main/docs/workflow/README.md)
+to prepare a build environment, then build a Checked runtime:
 
 ```bash
+# Linux/macOS
 ./build.sh -subset clr -c Checked
 ./build.sh -subset libs -c Release -rc Checked
-./src/tests/build.sh x64 checked skipmanaged skipnative
+
+# Windows
+build.cmd -subset clr -c Checked
+build.cmd -subset libs -c Release -rc Checked
 ```
 
-Download superpmi data.  This will download a few gigs worth of data:
+Download SuperPMI data (a few GB):
 
 ```bash
 python src/coreclr/scripts/superpmi.py download
 ```
 
-## Python Setup
+MCH files are locked to the JIT-EE interface version. Always download
+against the same runtime commit you are training with.
 
-This was developed and tested with Python 3.10 (3.11 on Windows).  Python 3.10 is the default Python version in Ubuntu 22.
+### 2. Python setup
 
-First, install all dependencies from requirements.txt in this directory:
+Create a virtual environment and install:
+
+```bash
+python -m venv .venv
+# Windows: .venv\Scripts\Activate.ps1
+# Linux/macOS: source .venv/bin/activate
+
+pip install -e .
+# or, for development (includes pylint/pytest):
+pip install -e .[dev]
+```
+
+If `pip install -e .` is not available (older pip), fall back to:
 
 ```bash
 pip install -r requirements.txt
@@ -122,5 +169,57 @@ Then use the format `[method_id]!JitMetrics=1!Var1=Value1!Var2=Value2` to jit me
 
 ## Pylint
 
-Please run `pylint *py jitml/` before checkin and clean up any warnings (no need to run it on the tests).  It's ok to silence warnings with `#pylint disable` if it makes more sense to do that than clean up what it's complaining about.
+Please run `pylint *.py jitml/` before checkin and clean up any warnings
+(no need to run it on the tests). It's ok to silence warnings with
+`# pylint: disable=...` if it makes more sense to do that than clean up
+what it's complaining about.
+
+## Status / roadmap
+
+This subtree is being revived. The initial import is unmodified from
+`leculver/jitml`. Planned work, in rough order:
+
+**M1 — Bring-up**
+
+- [x] Import as a git subtree of `leculver/jitml` under jitutils.
+- [ ] Modernize Python deps (Python 3.12, pydantic v2, SB3 2.4+,
+  gymnasium 1.0).
+- [ ] Verify `JitRLHook=1` streaming-SPMI round-trip against the current
+  JIT.
+- [ ] Fix any parser drift for new `JitMetrics` fields added since 2024.
+- [ ] End-to-end smoke train + smoke evaluate.
+
+**M2 — Evaluation harness**
+
+- [ ] Refactor `evaluate.py`: greedy-policy CSV, aggregate summary.
+- [ ] Deterministic train/test split.
+- [ ] Optional matplotlib plots.
+- [ ] Plumb code size, prolog size, and JIT time as passive metrics.
+
+**M3 — Feature / interface refresh**
+
+- [ ] Audit the 19 `CSE_HeuristicRLHook` features vs. today's JIT.
+- [ ] Split `enreg_count` into per-register-class counts
+  ([optcse.h:246](https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/optcse.h#L246)).
+- [ ] Review the `containable` feature.
+- [ ] Repoint the stale `optcse.cpp:3149` path comment at this directory.
+
+**M4 — Feature engineering / rewards / hyperparameters**
+
+- [ ] Fix feature normalization ([jitml#1](https://github.com/leculver/jitml/issues/1)).
+- [ ] Reward shaping (delta-from-heuristic, delta-from-best-of-N random).
+- [ ] Curriculum by CSE-candidate count.
+- [ ] PPO hyperparameter sweep (Optuna).
+- [ ] Attention-over-candidates architecture
+  ([jitml#8](https://github.com/leculver/jitml/issues/8)).
+- [ ] Head-to-head vs. the current heuristic on multiple MCH files.
+
+## References
+
+- Original C# MLCSE and RL background:
+  [../jit-rl-cse/README.md](../jit-rl-cse/README.md)
+- JIT-side hook: `CSE_HeuristicRLHook` in
+  [`src/coreclr/jit/optcse.cpp`](https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/optcse.cpp)
+- Upstream project (dormant since Jun 2024):
+  [`leculver/jitml`](https://github.com/leculver/jitml)
 
