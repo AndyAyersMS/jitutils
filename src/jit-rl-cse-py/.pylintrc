@@ -1,0 +1,9 @@
+[MASTER]
+ignore=tests/,scripts/
+extension-pkg-whitelist=tensorflow,tensorflow.keras
+
+[FORMAT]
+max-line-length = 120
+
+[DESIGN]
+max-args=8
