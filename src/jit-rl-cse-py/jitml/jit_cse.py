@@ -11,7 +11,12 @@ from .constants import (INVALID_ACTION_PENALTY, INVALID_ACTION_LIMIT, MAX_CSE, i
 # observation space
 JITTYPE_ONEHOT_SIZE = 6
 BOOLEAN_FEATURES = 7
-FLOAT_FEATURES = 9
+# 8 core scalar features + 4 enreg-count buckets (int/float/simd/msk).
+# The RLHook emits enreg counts split by register class rather than a
+# single lumped value; older JIT builds that emit only ``enreg_count``
+# leave the per-class buckets at zero and the aggregate is not
+# incorporated into the observation.
+FLOAT_FEATURES = 12
 FEATURES = JITTYPE_ONEHOT_SIZE + BOOLEAN_FEATURES + FLOAT_FEATURES
 
 # Scale up the reward to make it more meaningful.
@@ -23,7 +28,8 @@ class JitCseEnv(gym.Env):
         [
             "can_apply", "live_across_call", "const", "shared_const", "make_cse", "has_call", "containable",
             "cost_ex", "cost_sz", "use_count", "def_count", "use_wt_cnt", "def_wt_cnt", "distinct_locals",
-            "local_occurrences", "enreg_count"
+            "local_occurrences",
+            "enreg_count_int", "enreg_count_float", "enreg_count_simd", "enreg_count_msk",
         ]
 
     def __init__(self, context : SuperPmiContext, methods : Optional[List[int]] = None, **kwargs):
@@ -194,7 +200,8 @@ class JitCseEnv(gym.Env):
             # float features
             tensor.extend([
                 cse.cost_ex, cse.cost_sz, cse.use_count, cse.def_count, cse.use_wt_cnt, cse.def_wt_cnt,
-                cse.distinct_locals, cse.local_occurrences, cse.enreg_count
+                cse.distinct_locals, cse.local_occurrences,
+                cse.enreg_count_int, cse.enreg_count_float, cse.enreg_count_simd, cse.enreg_count_msk,
             ])
 
             tensors.append(tensor)

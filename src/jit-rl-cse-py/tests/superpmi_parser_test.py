@@ -38,7 +38,10 @@ STANDARD_LINE = (
     "spmi index 1234 (MethodHash=deadbeef) for method Foo:Bar():int (Tier1)"
 )
 
-RLHOOK_NO_FEATURES_NO_DECISIONS = (
+# 20-value feature payload = 1 (id) + 19 (legacy features); used to
+# exercise the parser's tolerance for pre-M3 JIT builds that emit only a
+# single lumped enreg_count.
+RLHOOK_LEGACY_NO_FEATURENAMES = (
     "; Total bytes of code 42, prolog size 4, PerfScore 12.50, instruction count 8, "
     "allocated bytes for code 42, num cse 0 num cand 2 "
     "features #0,1,1,0,0,0,0,0,0,1,1,1,1,10,10,1,1,1,0,0 "
@@ -46,14 +49,17 @@ RLHOOK_NO_FEATURES_NO_DECISIONS = (
     "spmi index 4321 (MethodHash=cafebabe) for method Foo:Baz():int (Tier1)"
 )
 
-RLHOOK_WITH_FEATURE_NAMES_AND_SEQ = (
+# 23-value feature payload = 1 (id) + 22 (M3 features: split enreg counts).
+# The trailing 4 slots are enreg_count_{int,float,simd,msk}.
+RLHOOK_M3_WITH_FEATURE_NAMES_AND_SEQ = (
     "; Total bytes of code 42, prolog size 4, PerfScore 12.50, instruction count 8, "
     "allocated bytes for code 42, num cse 1 num cand 2 "
     "featureNames type,viable,live_across_call,const,shared_const,make_cse,has_call,"
     "containable,cost_ex,cost_sz,use_count,def_count,use_wt_cnt,def_wt_cnt,"
-    "distinct_locals,local_occurrences,bb_count,block_spread,enreg_count "
-    "features #0,1,1,0,0,0,0,0,0,1,1,1,1,10,10,1,1,1,0,0 "
-    "features #1,1,0,0,0,0,0,0,0,1,1,1,1,10,10,1,1,1,0,0 "
+    "distinct_locals,local_occurrences,bb_count,block_spread,"
+    "enreg_count_int,enreg_count_float,enreg_count_simd,enreg_count_msk "
+    "features #0,1,1,0,0,0,0,0,0,1,1,1,1,10,10,1,1,1,0,3,1,0,0 "
+    "features #1,1,0,0,0,0,0,0,0,1,1,1,1,10,10,1,1,1,0,3,1,0,0 "
     "seq 1 "
     "spmi index 4321 (MethodHash=cafebabe) for method Foo:Baz():int (Tier1)"
 )
@@ -82,7 +88,7 @@ def test_parses_standard_heuristic():
 
 def test_parses_rlhook_no_featurenames_no_seq():
     parser = _new_parser()
-    ctx = parser._parse_method_context(RLHOOK_NO_FEATURES_NO_DECISIONS)
+    ctx = parser._parse_method_context(RLHOOK_LEGACY_NO_FEATURENAMES)
     # No heuristic name is emitted by CSE_HeuristicRLHook::DumpMetrics.
     assert ctx.heuristic == ""
     assert ctx.cses_chosen == []
@@ -92,7 +98,7 @@ def test_parses_rlhook_no_featurenames_no_seq():
 
 def test_parses_rlhook_with_featurenames_and_seq():
     parser = _new_parser()
-    ctx = parser._parse_method_context(RLHOOK_WITH_FEATURE_NAMES_AND_SEQ)
+    ctx = parser._parse_method_context(RLHOOK_M3_WITH_FEATURE_NAMES_AND_SEQ)
     assert ctx.heuristic == ""
     assert ctx.cses_chosen == [1]
     assert len(ctx.cse_candidates) == 2
@@ -101,22 +107,29 @@ def test_parses_rlhook_with_featurenames_and_seq():
     assert cand0.type == 1
     assert cand0.viable is True
     assert cand0.applied is False
+    # M3-format enreg counts land in the per-class fields, not the legacy slot.
+    assert cand0.enreg_count_int   == 3
+    assert cand0.enreg_count_float == 1
+    assert cand0.enreg_count_simd  == 0
+    assert cand0.enreg_count_msk   == 0
+    assert cand0.enreg_count is None
     assert cand1.index == 1
     assert cand1.applied is True  # index 1 appears in `seq 1`
 
 
 def test_feature_names_are_learned_and_cached():
     parser = _new_parser()
-    # First call: emits featureNames, so we learn them.
-    parser._parse_method_context(RLHOOK_WITH_FEATURE_NAMES_AND_SEQ)
+    # First call: emits M3-format featureNames, so we learn them.
+    parser._parse_method_context(RLHOOK_M3_WITH_FEATURE_NAMES_AND_SEQ)
     assert parser._feature_names is not None
     assert parser._feature_names[0] == "id"
     assert "type" in parser._feature_names
-    assert "enreg_count" in parser._feature_names
+    assert "enreg_count_int" in parser._feature_names
+    assert "enreg_count_msk" in parser._feature_names
 
     # Second call: no featureNames in line, but we still decode candidates
     # using the cached names.
-    ctx = parser._parse_method_context(RLHOOK_NO_FEATURES_NO_DECISIONS)
+    ctx = parser._parse_method_context(RLHOOK_M3_WITH_FEATURE_NAMES_AND_SEQ)
     assert len(ctx.cse_candidates) == 2
 
 
@@ -124,8 +137,8 @@ def test_extract_heuristic_name_helper():
     # Direct unit test of the helper.
     extract = SuperPmi._extract_heuristic_name
     assert extract(STANDARD_LINE) == "Standard CSE Heuristic"
-    assert extract(RLHOOK_NO_FEATURES_NO_DECISIONS) == ""
-    assert extract(RLHOOK_WITH_FEATURE_NAMES_AND_SEQ) == ""
+    assert extract(RLHOOK_LEGACY_NO_FEATURENAMES) == ""
+    assert extract(RLHOOK_M3_WITH_FEATURE_NAMES_AND_SEQ) == ""
 
     # Multi-word heuristic names must be preserved intact.
     line = (
@@ -137,3 +150,25 @@ def test_extract_heuristic_name_helper():
     # No heuristic name and only spmi index following.
     line = "num cand 0 spmi index 5 (MethodHash=0) for method X:Y():int (Tier1)"
     assert extract(line) == ""
+
+
+def test_legacy_enreg_count_field_still_accepted():
+    """A legacy JIT that emits ``enreg_count`` (rather than the four split
+    per-register-class fields) should still parse; the value lands in the
+    ``enreg_count`` slot and the per-class fields default to zero."""
+    line = (
+        "; Total bytes of code 42, prolog size 4, PerfScore 12.50, instruction count 8, "
+        "allocated bytes for code 42, num cse 0 num cand 1 "
+        "featureNames type,viable,live_across_call,const,shared_const,make_cse,has_call,"
+        "containable,cost_ex,cost_sz,use_count,def_count,use_wt_cnt,def_wt_cnt,"
+        "distinct_locals,local_occurrences,bb_count,block_spread,enreg_count "
+        "features #0,1,1,0,0,0,0,0,0,1,1,1,1,10,10,1,1,1,0,7 "
+        "spmi index 42 (MethodHash=0) for method Foo:Bar():int (Tier1)"
+    )
+    parser = _new_parser()
+    ctx = parser._parse_method_context(line)
+    assert len(ctx.cse_candidates) == 1
+    cand = ctx.cse_candidates[0]
+    assert cand.enreg_count == 7
+    assert cand.enreg_count_int == 0
+    assert cand.enreg_count_float == 0

@@ -37,7 +37,17 @@ class CseCandidate(BaseModel):
     local_occurrences : int
     bb_count : int
     block_spread : int
-    enreg_count : int
+    # Enregisterable local counts split by register class. Prior to
+    # PR https://github.com/dotnet/runtime/pull/<TBD> these were a single
+    # ``enreg_count`` field that lumped SIMD/mask registers under the
+    # integer budget. Keep the legacy field as an optional int for
+    # forward/backward compatibility with older JIT builds that only
+    # emit one aggregate slot; new code should use the per-class fields.
+    enreg_count_int   : int = 0
+    enreg_count_float : int = 0
+    enreg_count_simd  : int = 0
+    enreg_count_msk   : int = 0
+    enreg_count       : Optional[int] = None
 
     @field_validator('applied', 'viable', 'live_across_call', 'const', 'shared_const', 'make_cse', 'has_call',
                      'containable', mode='before')

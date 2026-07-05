@@ -199,7 +199,7 @@ This subtree is being revived. The initial import is unmodified from
 **M3 — Feature / interface refresh**
 
 - [ ] Audit the 19 `CSE_HeuristicRLHook` features vs. today's JIT.
-- [ ] Split `enreg_count` into per-register-class counts
+- [x] Split `enreg_count` into per-register-class counts
   ([optcse.h:246](https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/optcse.h#L246)).
 - [ ] Review the `containable` feature.
 - [ ] Repoint the stale `optcse.cpp:3149` path comment at this directory.
