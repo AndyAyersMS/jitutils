@@ -51,6 +51,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--scan_limit", type=int, default=400,
                         help="How many methods to scan from the MCH looking for candidates "
                              "before giving up (default 400).")
+    parser.add_argument("--no-stratify", action="store_true",
+                        help="Disable stratified candidate-count bucketing in _pick_methods "
+                             "(fall back to picking the first N CSE-eligible methods).")
     parser.add_argument("--algorithm", default="PPO", choices=("PPO", "A2C", "DQN"))
     parser.add_argument("--parallel", type=int, default=None,
                         help="Number of parallel SubprocVecEnv workers (each spawns its own "
@@ -66,12 +69,51 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _pick_methods(spmi: SuperPmi, scan_limit: int, want: int) -> List[MethodContext]:
-    """Scan the MCH one method at a time; return the first ``want`` methods
+def _pick_methods(spmi: SuperPmi, scan_limit: int, want: int,
+                  stratified: bool = True) -> List[MethodContext]:
+    """Scan the MCH one method at a time; return up to ``want`` methods
     that pass ``is_acceptable_for_cse`` (i.e. have between MIN_CSE and
-    MAX_CSE viable candidates)."""
-    keeps: List[MethodContext] = []
+    MAX_CSE viable candidates).
+
+    If ``stratified`` is True (default), the picks are balanced across
+    candidate-count buckets [1-3], [4-6], [7-10], [11-16] so the training
+    distribution isn't dominated by whichever bucket happens to be dense
+    at the front of the MCH. This directly addresses the training bias
+    the Phase-0 diagnostic surfaced (policy learning positional shortcuts
+    from a homogeneous training set).
+    """
+    if not stratified:
+        keeps: List[MethodContext] = []
+        for idx in range(1, scan_limit + 1):
+            try:
+                ctx = spmi.jit_method(idx, JitMetrics=1, JitRLHook=1,
+                                      JitRLHookEmitFeatureNames=1,
+                                      JitRLHookCSEDecisions=[])
+            except Exception as exc:  # noqa: BLE001
+                print(f"  idx={idx}: jit failed ({type(exc).__name__}: {exc}); skipping")
+                continue
+            if ctx is None or not is_acceptable_for_cse(ctx):
+                continue
+            keeps.append(ctx)
+            if len(keeps) >= want:
+                break
+        return keeps
+
+    # Stratified path: fill four candidate-count buckets in parallel.
+    buckets = ((1, 3), (4, 6), (7, 10), (11, 16))
+    per_bucket = max(1, want // len(buckets))
+    holds: List[List[MethodContext]] = [[] for _ in buckets]
+
+    def bucket_of(n: int) -> int:
+        for i, (lo, hi) in enumerate(buckets):
+            if lo <= n <= hi:
+                return i
+        return -1
+
     for idx in range(1, scan_limit + 1):
+        # Stop if every bucket is full.
+        if all(len(h) >= per_bucket for h in holds):
+            break
         try:
             ctx = spmi.jit_method(idx, JitMetrics=1, JitRLHook=1,
                                   JitRLHookEmitFeatureNames=1,
@@ -79,15 +121,17 @@ def _pick_methods(spmi: SuperPmi, scan_limit: int, want: int) -> List[MethodCont
         except Exception as exc:  # noqa: BLE001
             print(f"  idx={idx}: jit failed ({type(exc).__name__}: {exc}); skipping")
             continue
-
         if ctx is None or not is_acceptable_for_cse(ctx):
             continue
+        b = bucket_of(ctx.num_cse_candidate)
+        if b < 0 or len(holds[b]) >= per_bucket:
+            continue
+        holds[b].append(ctx)
 
-        keeps.append(ctx)
-        if len(keeps) >= want:
-            break
-
-    return keeps
+    picked = [m for h in holds for m in h]
+    print(f"  stratified picks per bucket: "
+          f"{[f'{buckets[i][0]}-{buckets[i][1]}={len(h)}' for i, h in enumerate(holds)]}")
+    return picked
 
 
 def _prime_cache(mch: str, core_root: str, methods_no_cse: List[MethodContext],
@@ -135,7 +179,8 @@ def main() -> int:
           f"CSE-eligible candidates...")
     t0 = time.time()
     with SuperPmi(args.mch, args.core_root) as spmi:
-        picked = _pick_methods(spmi, args.scan_limit, args.num_methods)
+        picked = _pick_methods(spmi, args.scan_limit, args.num_methods,
+                               stratified=not args.no_stratify)
     print(f"      picked {len(picked)} methods in {time.time()-t0:.1f}s")
 
     if len(picked) < 3:

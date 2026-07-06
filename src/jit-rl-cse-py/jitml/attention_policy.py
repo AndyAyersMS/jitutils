@@ -107,9 +107,24 @@ class AttentionOverCandidatesExtractor(BaseFeaturesExtractor):
         cands = observations["candidates"]  # (batch, max_cse, per_cand_feats)
         method = observations["method"]     # (batch, method_feats)
 
+        # Build a padding mask so attention ignores zero-padded candidate
+        # rows (which sit past the method's true CSE count and are all
+        # zeros by the env encoder's construction). Without this mask the
+        # policy can learn positional shortcuts -- e.g. always attend to
+        # candidate #1 -- since the fixed-position noise is stable across
+        # methods.
+        #
+        # ``key_padding_mask``: True where the row is padding.
+        padding_mask = (cands.abs().sum(dim=-1) == 0)  # (batch, max_cse)
+
         cand_emb = self.candidate_embed(cands)          # (batch, max_cse, embed_dim)
-        cand_out = self.attn(cand_emb)                  # (batch, max_cse, embed_dim)
-        cand_pooled = cand_out.mean(dim=1)              # (batch, embed_dim)
+        cand_out = self.attn(cand_emb, src_key_padding_mask=padding_mask)
+
+        # Mean-pool over real candidates only (denominator = # non-padding
+        # rows). Guard against divide-by-zero for the (theoretical)
+        # all-padding batch element.
+        keep = (~padding_mask).unsqueeze(-1).float()    # (batch, max_cse, 1)
+        cand_pooled = (cand_out * keep).sum(dim=1) / keep.sum(dim=1).clamp(min=1.0)
 
         method_emb = self.method_embed(method)          # (batch, embed_dim)
 
