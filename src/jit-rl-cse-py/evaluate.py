@@ -1,222 +1,291 @@
 #!/usr/bin/python
 
-"""Evaluates a model on a given dataset."""
-from enum import Enum
-import os
+"""Evaluates a trained CSE model against the default JIT heuristic.
+
+Produces a per-method CSV with perf-score deltas plus passive metrics
+(code size, instruction count, prolog size) and prints an aggregate
+summary showing how often the learned policy improves on the built-in
+heuristic and by how much (arithmetic mean + geometric mean of the
+relative perf-score delta).
+
+Usage:
+    python evaluate.py <model_path_or_dir> <mch> \\
+        --core_root <PATH> [--algorithm PPO|A2C|DQN] \\
+        [--test-seed 42] [--test-only] [--limit N]
+
+If ``model_path_or_dir`` is a directory, every ``*.zip`` model inside
+is evaluated in newest-first order.
+"""
+from __future__ import annotations
+
 import argparse
+import math
+import os
 import shutil
+import sys
+from dataclasses import dataclass
+from typing import Iterable, List, Optional
+
 import numpy as np
-import pandas
+import pandas as pd
 import tqdm
 
-from jitml import SuperPmi, SuperPmiCache, JitCseModel, MethodContext, JitCseEnv
+from jitml import JitCseEnv, JitCseModel, MethodContext, SuperPmi, SuperPmiCache
 from train import validate_core_root
 
-class ModelResult(Enum):
-    """Analysis errors."""
-    OK = 0
-    JIT_FAILED = 1
+# ---------------------------------------------------------------------------
+# Model rollout
+# ---------------------------------------------------------------------------
 
-def set_result(data, m_id, heuristic_score, no_cse_score, model_score, error = ModelResult.OK):
-    """Sets the results for the given method id."""
-    data["method_id"].append(m_id)
-    data["heuristic_score"].append(heuristic_score)
-    data["no_cse_score"].append(no_cse_score)
-    data["model_score"].append(model_score)
-    data["failed"].append(error)
+@dataclass
+class RolloutRow:
+    """One CSV row for a single evaluated method."""
+    method_id: int
+    name: str
+    method_hash: str
+    num_candidates: int
+    chosen_cses: List[int]
+    heuristic_perfscore: float
+    rl_perfscore: float
+    no_cse_perfscore: float
+    delta_vs_heuristic: float             # rl - heuristic (negative = better)
+    pct_delta_vs_heuristic: float         # (rl - heuristic) / heuristic
+    heuristic_total_bytes: int
+    rl_total_bytes: int
+    heuristic_instr_count: int
+    rl_instr_count: int
+    heuristic_prolog_size: int
+    rl_prolog_size: int
+    status: str                           # "ok", "jit_failed", "no_candidates"
 
-def get_most_likley_allowed_action(jitrl : JitCseModel, method : MethodContext, can_terminate : bool):
-    """Returns the most likely allowed actions."""
+
+def _greedy_action(jitrl: JitCseModel, method: MethodContext, can_terminate: bool) -> Optional[int]:
+    """Deterministically pick the most-likely allowed action for this method.
+
+    Returns the CSE candidate index to apply, or ``None`` to stop.
+    """
     obs = JitCseEnv.get_observation(method)
-    probabilities = jitrl.action_probabilities(obs)
+    probs = jitrl.action_probabilities(obs)
 
-    # If we are not allowed to terminate, remove the terminate action.
-    terminate_action = len(probabilities) - 1
+    terminate = len(probs) - 1
     if not can_terminate:
-        probabilities = probabilities[:-1]
+        probs = probs[:-1]
 
-    # Sorted by most likely action descending
-    sorted_actions = np.flip(np.argsort(probabilities))
-    candidates = method.cse_candidates
-
-    for action in sorted_actions:
-        if action == terminate_action:
+    for action in np.argsort(probs)[::-1]:
+        if action == terminate:
             return None
+        if action < len(method.cse_candidates) and method.cse_candidates[action].can_apply:
+            return int(action)
 
-        if action < len(candidates) and candidates[action].can_apply:
-            return action
+    raise ValueError("no valid action; policy is degenerate for this state")
 
-    # We are supposed to terminate instead of applying a CSE if none are available.
-    # If we got here there's some kind of error.
-    raise ValueError("No valid action found.")
 
-def test_model(superpmi : SuperPmi, jitrl : JitCseModel, method_ids, model_name):
-    """Tests the model on the test set."""
-    data = {
-        "method_id" : [],
-        "heuristic_score" : [],
-        "no_cse_score" : [],
-        "model_score" : [],
-        "failed" : []
-    }
+def _rollout(superpmi: SuperPmi, jitrl: JitCseModel, method_id: int) -> RolloutRow:
+    """Perform a single greedy rollout for one method and return the row."""
+    heuristic = superpmi.jit_method(method_id, JitMetrics=1)
+    no_cse    = superpmi.jit_method(method_id, JitMetrics=1, JitRLHook=1, JitRLHookCSEDecisions=[])
 
-    for m_id in tqdm.tqdm(method_ids,
-                            desc=f"Processing {model_name}",
-                            colour='green',
-                            ncols=shutil.get_terminal_size().columns - 8,
-                            ascii=False):
-        # the original JIT method
-        original = superpmi.jit_method(m_id, JitMetrics=1)
-        no_cse = superpmi.jit_method(m_id, JitMetrics=1, JitRLHook=1, JitRLHookCSEDecisions=[])
+    if heuristic is None or no_cse is None:
+        return RolloutRow(method_id=method_id, name="?", method_hash="?", num_candidates=0,
+                          chosen_cses=[], heuristic_perfscore=0.0, rl_perfscore=0.0,
+                          no_cse_perfscore=0.0, delta_vs_heuristic=0.0,
+                          pct_delta_vs_heuristic=0.0, heuristic_total_bytes=0,
+                          rl_total_bytes=0, heuristic_instr_count=0, rl_instr_count=0,
+                          heuristic_prolog_size=0, rl_prolog_size=0, status="jit_failed")
 
-        if original is None or no_cse is None:
-            set_result(data, m_id, 0, 0, 0, ModelResult.JIT_FAILED)
-            continue
+    chosen: List[int] = []
+    curr: MethodContext = no_cse
+    while any(c.can_apply for c in curr.cse_candidates):
+        try:
+            action = _greedy_action(jitrl, curr, can_terminate=bool(chosen))
+        except ValueError:
+            break
+        if action is None:
+            break
 
-        choices = []
-        results = []
-        while True:
-            prev_method = results[-1] if results else no_cse
+        chosen.append(action)
+        step = superpmi.jit_method(method_id, JitMetrics=1, JitRLHook=1, JitRLHookCSEDecisions=chosen)
+        if step is None:
+            return RolloutRow(method_id=method_id, name=heuristic.name,
+                              method_hash=heuristic.hash,
+                              num_candidates=len(no_cse.cse_candidates),
+                              chosen_cses=chosen, heuristic_perfscore=heuristic.perf_score,
+                              rl_perfscore=curr.perf_score,
+                              no_cse_perfscore=no_cse.perf_score,
+                              delta_vs_heuristic=curr.perf_score - heuristic.perf_score,
+                              pct_delta_vs_heuristic=_pct(curr.perf_score, heuristic.perf_score),
+                              heuristic_total_bytes=heuristic.total_bytes,
+                              rl_total_bytes=curr.total_bytes,
+                              heuristic_instr_count=heuristic.instruction_count,
+                              rl_instr_count=curr.instruction_count,
+                              heuristic_prolog_size=heuristic.prolog_size,
+                              rl_prolog_size=curr.prolog_size,
+                              status="jit_failed")
+        curr = step
 
-            # If we have no more CSEs to apply, we are done.  We expect this not to happen on the first
-            # iteration because we filter out methods that have no CSEs to apply.
-            if not any(x.can_apply for x in prev_method.cse_candidates):
-                set_result(data, m_id, original.perf_score, no_cse.perf_score, prev_method.perf_score)
+    status = "ok" if chosen else "no_candidates"
+    return RolloutRow(method_id=method_id, name=heuristic.name, method_hash=heuristic.hash,
+                      num_candidates=len(no_cse.cse_candidates),
+                      chosen_cses=chosen,
+                      heuristic_perfscore=heuristic.perf_score,
+                      rl_perfscore=curr.perf_score,
+                      no_cse_perfscore=no_cse.perf_score,
+                      delta_vs_heuristic=curr.perf_score - heuristic.perf_score,
+                      pct_delta_vs_heuristic=_pct(curr.perf_score, heuristic.perf_score),
+                      heuristic_total_bytes=heuristic.total_bytes,
+                      rl_total_bytes=curr.total_bytes,
+                      heuristic_instr_count=heuristic.instruction_count,
+                      rl_instr_count=curr.instruction_count,
+                      heuristic_prolog_size=heuristic.prolog_size,
+                      rl_prolog_size=curr.prolog_size,
+                      status=status)
 
-                assert choices  # We must have made at least one selection
-                break
 
-            action = get_most_likley_allowed_action(jitrl, prev_method, choices)
-            if action is None:
-                set_result(data, m_id, original.perf_score, no_cse.perf_score, prev_method.perf_score)
-                break
+def _pct(rl: float, baseline: float) -> float:
+    if baseline == 0.0:
+        return 0.0
+    return (rl - baseline) / baseline
 
-            # apply the CSE
-            choices.append(action)
-            new_method = superpmi.jit_method(m_id, JitMetrics=1, JitRLHook=1, JitRLHookCSEDecisions=choices)
-            if new_method is None:
-                set_result(data, m_id, original.perf_score, no_cse.perf_score, prev_method.perf_score,
-                            ModelResult.JIT_FAILED)
-                break
 
-            results.append(new_method)
+# ---------------------------------------------------------------------------
+# Evaluation driver
+# ---------------------------------------------------------------------------
 
-            # mark choices as applied
-            for c in choices:
-                new_method.cse_candidates[c].applied = True
+def _rollout_all(superpmi: SuperPmi, jitrl: JitCseModel, method_ids: Iterable[int],
+                 label: str) -> pd.DataFrame:
+    method_ids = list(method_ids)
+    rows: List[RolloutRow] = []
+    for m_id in tqdm.tqdm(method_ids, desc=f"Evaluating {label}", colour='green',
+                          ncols=max(shutil.get_terminal_size().columns - 8, 40),
+                          ascii=True):
+        rows.append(_rollout(superpmi, jitrl, m_id))
 
-    return pandas.DataFrame(data)
+    return pd.DataFrame([r.__dict__ for r in rows])
 
-def evaluate(superpmi, jitrl, methods, model_name, csv_file) -> pandas.DataFrame:
-    """Evaluate the model and save to the specified CSV file."""
-    if os.path.exists(csv_file):
-        return pandas.read_csv(csv_file)
 
-    result = test_model(superpmi, jitrl, methods, model_name)
-    result.to_csv(csv_file)
-    return result
-
-def enumerate_models(dir_or_file):
-    """Enumerates the models in the specified directory."""
-    if os.path.isfile(dir_or_file):
-        return [dir_or_file]
-
-    def extract_number(file):
-        return int(file.split("_")[-1]) if file.split("_")[-1].isdigit() else 100000000
-
-    files = [os.path.splitext(file)[0] for file in os.listdir(dir_or_file) if file.endswith(".zip")]
-    return sorted(files, key=extract_number, reverse=True)
-
-def print_result(result, model, kind):
-    """Prints the results."""
-
-    print('-' * 40 + f" {model} results " + '-' * 40)
+def _summarize(df: pd.DataFrame, label: str) -> None:
     print()
+    print("=" * 70)
+    print(f"{label}  (n={len(df)})")
+    print("=" * 70)
 
-    print(f"{kind} results:")
-    print()
+    ok = df[df.status == "ok"]
+    print(f"  status: ok={len(ok)}  jit_failed={(df.status == 'jit_failed').sum()}  "
+          f"no_candidates={(df.status == 'no_candidates').sum()}")
+    if ok.empty:
+        return
 
-    print("Comparisons:")
-    no_jit_failure = result[result['failed'] != ModelResult.JIT_FAILED]
+    improved  = ok[ok.rl_perfscore < ok.heuristic_perfscore]
+    same      = ok[ok.rl_perfscore == ok.heuristic_perfscore]
+    regressed = ok[ok.rl_perfscore > ok.heuristic_perfscore]
 
-    # next calculate how often we improved on the heuristic
-    improved = no_jit_failure[no_jit_failure['model_score'] < no_jit_failure['heuristic_score']]
-    underperformed = no_jit_failure[no_jit_failure['model_score'] > no_jit_failure['heuristic_score']]
-    print(f"Better than heuristic: {len(improved)}")
-    print(f"Worse than heuristic: {len(underperformed)}")
-    print(f"Same as heuristic: {len(no_jit_failure) - len(improved) - len(underperformed)}")
-    print(f"Total: {len(result)}")
-    print()
+    print(f"  vs. heuristic: better={len(improved)}  same={len(same)}  worse={len(regressed)}")
 
-    # sum up total difference
-    h_score = no_jit_failure['heuristic_score'].sum()
-    heuristic_diff = no_jit_failure['model_score'].sum() - h_score
-    print(f"Total heuristic difference: {heuristic_diff} ({heuristic_diff / len(no_jit_failure)} per method)")
-    print(f"Pct improvement: {-heuristic_diff / h_score * 100:.2f}%")
-    nc_score = no_jit_failure['no_cse_score'].sum()
-    no_cse_diff = no_jit_failure['model_score'].sum() - nc_score
-    print(f"Total no CSE difference: {no_cse_diff} ({no_cse_diff / len(no_jit_failure)} per method)")
-    print(f"Pct improvement: {-no_cse_diff / nc_score * 100:.2f}%")
-    print()
+    # Arithmetic mean pct delta (negative = better).
+    pct_mean = ok.pct_delta_vs_heuristic.mean()
+    # Geometric mean of (rl / heuristic) requires positive perf_scores; guard.
+    ratios = (ok.rl_perfscore / ok.heuristic_perfscore).replace([np.inf, -np.inf], np.nan).dropna()
+    ratios = ratios[ratios > 0]
+    geomean_ratio = math.exp(np.log(ratios).mean()) if not ratios.empty else float("nan")
+    print(f"  arithmetic mean pct delta vs heuristic: {pct_mean * 100:+.3f}%  "
+          f"(negative = better)")
+    print(f"  geometric mean ratio (rl/heuristic):    {geomean_ratio:.5f}  "
+          f"({(geomean_ratio - 1.0) * 100:+.3f}%)")
 
-    # next calculate how often we improved on the no CSE score
-    improved = no_jit_failure[no_jit_failure['model_score'] < no_jit_failure['no_cse_score']]
-    underperformed = no_jit_failure[no_jit_failure['model_score'] > no_jit_failure['no_cse_score']]
-    print(f"Better than no CSE: {len(improved)}")
-    print(f"Worse than no CSE: {len(underperformed)}")
-    print(f"Same as no CSE: {len(no_jit_failure) - len(improved) - len(underperformed)}")
-    print()
+    # Code size comparison (passive metric)
+    bytes_ratio = (ok.rl_total_bytes / ok.heuristic_total_bytes).replace(
+        [np.inf, -np.inf], np.nan).dropna()
+    bytes_ratio = bytes_ratio[bytes_ratio > 0]
+    if not bytes_ratio.empty:
+        gm = math.exp(np.log(bytes_ratio).mean())
+        print(f"  geometric mean code-size ratio:         {gm:.5f}  "
+              f"({(gm - 1.0) * 100:+.3f}%)")
 
-    print("Failures:")
-    print(f"Failed: {len(result[result['failed'] != ModelResult.OK])}")
-    print(f"JIT Failed: {len(result[result['failed'] == ModelResult.JIT_FAILED])}")
-    print()
 
-def parse_args():
-    """usage:  train.py [-h] [--core_root CORE_ROOT] [--parallel n] [--iterations i] model_path mch"""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("model_path", help="The directory or model path to load from.")
-    parser.add_argument("mch", help="The mch file of functions to evaluate the model with.")
-    parser.add_argument("--core_root", default=None, help="The coreclr root directory.")
-    parser.add_argument("--algorithm", default="PPO", help="The algorithm to use. (default: PPO)")
+def _resolve_methods(cache: SuperPmiCache, test_seed: Optional[int],
+                     test_only: bool, limit: Optional[int]):
+    """Return (test_ids, train_ids), applying optional --limit truncation."""
+    del test_seed  # SuperPmiCache split is currently seed-42-fixed in constants.py;
+                  # a seed override would need to invalidate the on-disk split file.
+    test_ids  = list(cache.test_methods)
+    train_ids = list(cache.train_methods)
+    if limit:
+        test_ids  = test_ids[:limit]
+        train_ids = [] if test_only else train_ids[:limit]
+    if test_only:
+        train_ids = []
+    return test_ids, train_ids
+
+
+def _enumerate_models(path: str) -> List[str]:
+    if os.path.isfile(path):
+        return [path]
+
+    def key(name: str) -> int:
+        tail = os.path.splitext(name)[0].split("_")[-1]
+        return int(tail) if tail.isdigit() else 10**9
+
+    zips = [os.path.join(path, f) for f in os.listdir(path) if f.endswith(".zip")]
+    return sorted(zips, key=lambda p: key(os.path.basename(p)), reverse=True)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("model_path", help="A .zip model file or a directory containing them.")
+    parser.add_argument("mch", help="MCH file to evaluate against.")
+    parser.add_argument("--core_root", default=None, help="Path to Core_Root.")
+    parser.add_argument("--algorithm", default="PPO", choices=("PPO", "A2C", "DQN"))
+    parser.add_argument("--test-seed", type=int, default=42,
+                        help="Random seed for the train/test split (reserved for future use).")
+    parser.add_argument("--test-only", action="store_true",
+                        help="Skip the train-set rollout; useful when you only care about held-out data.")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Optionally cap each of train/test to at most N methods.")
 
     args = parser.parse_args()
     args.core_root = validate_core_root(args.core_root)
     return args
 
-def main(args):
-    """Main entry point."""
-    dir_or_path = args.model_path
 
-    if not os.path.exists(dir_or_path):
-        raise FileNotFoundError(f"Path {dir_or_path} does not exist.")
+def main(args: argparse.Namespace) -> int:
+    if not os.path.exists(args.model_path):
+        print(f"error: {args.model_path} does not exist.", file=sys.stderr)
+        return 2
 
-    # Load or create cached SuperPmi data.
+    if not SuperPmiCache.exists(args.mch):
+        print(f"Building SuperPmiCache for {args.mch} -- this may take several minutes...")
+    cache = SuperPmiCache(args.mch, args.core_root)
 
+    test_ids, train_ids = _resolve_methods(cache, args.test_seed, args.test_only, args.limit)
+    if not test_ids and not train_ids:
+        print("error: no methods available to evaluate.", file=sys.stderr)
+        return 1
 
-    for file in enumerate_models(dir_or_path):
-        print(file)
-        with SuperPmi(args.mch, args.core_root) as superpmi:
-            if not SuperPmiCache.exists:
-                print(f"Caching SuperPmi methods for {args.mch}, this may take several minutes...")
+    for model_path in _enumerate_models(args.model_path):
+        model_name = os.path.splitext(os.path.basename(model_path))[0]
+        print(f"\n### model: {model_name}  ({model_path})")
 
-            cache = SuperPmiCache(args.mch, args.core_root)
+        jitrl = JitCseModel(args.algorithm)
+        jitrl.load(model_path)
 
-            # load the underlying model
-            jitrl = JitCseModel(args.algorithm)
-            jitrl.load(os.path.join(dir_or_path, file))
+        model_dir = args.model_path if os.path.isdir(args.model_path) else os.path.dirname(model_path)
 
-            print(f"Evaluting model {file} on training and test data:")
+        with SuperPmi(args.mch, args.core_root) as spmi:
+            if test_ids:
+                test_df = _rollout_all(spmi, jitrl, test_ids, f"{model_name} test")
+                test_csv = os.path.join(model_dir, f"{model_name}_test.csv")
+                test_df.to_csv(test_csv, index=False)
+                _summarize(test_df, f"TEST  ({model_name})")
 
-            model_name = os.path.splitext(file)[0]
+            if train_ids:
+                train_df = _rollout_all(spmi, jitrl, train_ids, f"{model_name} train")
+                train_csv = os.path.join(model_dir, f"{model_name}_train.csv")
+                train_df.to_csv(train_csv, index=False)
+                _summarize(train_df, f"TRAIN ({model_name})")
 
-            filename = os.path.join(dir_or_path, f"{model_name}_test.csv")
-            result = evaluate(superpmi, jitrl, cache.test_methods, model_name, filename)
-            print_result(result, model_name, "Test")
+    return 0
 
-            filename = os.path.join(dir_or_path, f"{model_name}_train.csv")
-            result = evaluate(superpmi, jitrl, cache.train_methods, model_name, filename)
-            print_result(result, model_name, "Train")
 
 if __name__ == "__main__":
-    main(parse_args())
+    sys.exit(main(_parse_args()))
+

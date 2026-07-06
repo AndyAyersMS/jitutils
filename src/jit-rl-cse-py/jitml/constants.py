@@ -18,9 +18,14 @@ def is_acceptable_for_cse(method):
     applicable = len([x for x in method.cse_candidates if x.viable])
     return MIN_CSE <= applicable and len(method.cse_candidates) <= MAX_CSE
 
-def split_for_cse(methods : Sequence[MethodContext], test_percent=0.1):
+def split_for_cse(methods : Sequence[MethodContext], test_percent=0.1, seed=42):
     """Splits the methods into those that can be used for training and those that can't.
-    Returns the test and train sets."""
+    Returns the test and train sets.
+
+    ``seed`` is threaded through to the numpy RNG so callers can pin the
+    split deterministically to a chosen seed (default 42, matching
+    historical behaviour).
+    """
     method_by_cse = {}
 
     for x in methods:
@@ -35,11 +40,10 @@ def split_for_cse(methods : Sequence[MethodContext], test_percent=0.1):
     test = []
     train = []
 
-    # use a fixed seed so subsequent calls line up
     # Sort the groups of methods by length to ensure we don't care what order we process them in.
     # Then sort each method by id before shuffling to (again) ensure we get the same result.
     methods_list.sort(key=len)
-    rnd = np.random.default_rng(seed=42)
+    rnd = np.random.default_rng(seed=seed)
     for method_group in methods_list:
         split = int(len(method_group) * test_percent)
 
