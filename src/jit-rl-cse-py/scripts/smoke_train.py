@@ -57,6 +57,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--delta-reward", action="store_true",
                         help="Wrap the env with DeltaVsHeuristicRewardWrapper "
                              "(episode-end shaping term = (heuristic - final) / heuristic).")
+    parser.add_argument("--attention", action="store_true",
+                        help="Use the AttentionOverCandidatesExtractor custom SB3 policy "
+                             "(requires PPO or A2C).")
     return parser.parse_args()
 
 
@@ -169,7 +172,9 @@ def main() -> int:
         wrappers.append(DeltaVsHeuristicRewardWrapper)
         print("      + DeltaVsHeuristicRewardWrapper")
 
-    model = JitCseModel(args.algorithm)
+    model = JitCseModel(args.algorithm, use_attention=args.attention)
+    if args.attention:
+        print(f"      + AttentionOverCandidatesExtractor ({args.algorithm})")
 
     print(f"[5/5] running {args.algorithm} for {args.iterations} iterations...")
     t0 = time.time()

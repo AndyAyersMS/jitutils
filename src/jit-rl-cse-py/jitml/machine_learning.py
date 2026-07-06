@@ -22,7 +22,8 @@ from .jit_cse import JitCseEnv
 
 class JitCseModel:
     """The raw implementation of the machine learning agent."""
-    def __init__(self, algorithm, device='auto', make_env=None, ent_coef=0.01, verbose=False):
+    def __init__(self, algorithm, device='auto', make_env=None, ent_coef=0.01,
+                 verbose=False, use_attention=False, attention_kwargs=None):
         if algorithm not in ('PPO', 'A2C', 'DQN'):
             raise ValueError(f"Unknown algorithm {algorithm}.  Must be one of: PPO, A2C, DQN")
 
@@ -31,6 +32,12 @@ class JitCseModel:
         self.ent_coef = ent_coef
         self.verbose = verbose
         self.make_env = make_env
+        # If True, plug in the attention-over-candidates features
+        # extractor (see :mod:`jitml.attention_policy`). Only compatible
+        # with the Dict observation space and with PPO / A2C
+        # (DQN currently uses a different policy hierarchy).
+        self.use_attention = use_attention
+        self.attention_kwargs = attention_kwargs or {}
         self._model = None
 
     def load(self, path):
@@ -122,10 +129,26 @@ class JitCseModel:
         # SB3 needs MultiInputPolicy for Dict observation spaces and
         # MlpPolicy for flat Box spaces.
         policy = "MultiInputPolicy" if isinstance(env.observation_space, gym.spaces.Dict) else "MlpPolicy"
-        if alg == PPO:
-            return alg(policy, env, device=self.device, ent_coef=self.ent_coef, verbose=self.verbose, **kwargs)
 
-        return alg(policy, env, device=self.device, verbose=self.verbose, **kwargs)
+        # Optionally plug in the attention features extractor.
+        extra_kwargs = {}
+        if self.use_attention:
+            if alg is DQN:
+                raise ValueError("use_attention=True is only supported with PPO or A2C")
+            if policy != "MultiInputPolicy":
+                raise ValueError(
+                    "use_attention=True requires a Dict observation space "
+                    "(the default JitCseEnv provides one)."
+                )
+            from .attention_policy import make_attention_policy_kwargs
+            extra_kwargs["policy_kwargs"] = make_attention_policy_kwargs(**self.attention_kwargs)
+
+        if alg == PPO:
+            return alg(policy, env, device=self.device, ent_coef=self.ent_coef,
+                       verbose=self.verbose, **extra_kwargs, **kwargs)
+
+        return alg(policy, env, device=self.device, verbose=self.verbose,
+                   **extra_kwargs, **kwargs)
 
     def __get_algorithm(self):
         match self.algorithm:
