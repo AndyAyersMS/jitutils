@@ -77,41 +77,81 @@ class OptimalCseWrapper(gym.Wrapper):
 
 
 class NormalizeFeaturesWrapper(gym.ObservationWrapper):
-    """Removes unused features from the observation space."""
+    """Apply ``log1p`` to count-like features in the observation tensor.
 
-    # Calculated using scripts/calculate_feature_norm.py
-    obs_subtract = np.array([0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0,
-                             0.0, 0.0, 0.0], dtype=np.float32)
-    obs_scale = np.array([1.0, 1.0, 1.0, 1.0, 1, 1.0, 1.0, 1.0, 1.0, 1, 1.0, 1.0, 1.0, 0.012658227848101266,
-                       0.018867924528301886, 0.001763668430335097, 0.005291005291005291, 0.06988495589628721,
-                       0.07344255107610509, 0.2, 0.16666666666666666, 0.0013623978201634877], dtype=np.float32)
-    obs_log1p = np.array([False, False, False, False, False, False, False, False, False, False, False, False, False,
-                          False, False, False, False, True, True, False, False, False], dtype=bool)
+    Rationale: the raw features emitted by ``CSE_HeuristicRLHook`` mix
+    boolean / one-hot signals (already in a small range) with count-like
+    features (``use_wt_cnt_x100`` can reach 5-figure values,
+    ``cost_ex`` can reach the hundreds, etc.) that span multiple orders
+    of magnitude. Feeding them directly to a neural policy hurts
+    training because gradients explode. Applying ``log1p`` compresses
+    each count into a small range without dataset-specific statistics.
 
+    This wrapper deliberately does NOT drop any features -- that mixed
+    responsibility caused the original wrapper to silently break the
+    observation shape and prevent training.
+    """
 
-    unused_features = ['shared_const', 'type_struct']
-
-    def __init__(self, env):
+    def __init__(self, env: JitCseEnv):
         super().__init__(env)
 
-        # Remove the unused features from the observation space.
-        self.filter = np.array([name in NormalizeFeaturesWrapper.unused_features for name in env.observation_columns],
-                          dtype=bool)
+        columns = list(env.unwrapped.observation_columns)
+        # Everything after ``containable`` is a count-like feature.
+        count_start = columns.index("containable") + 1
+        mask = np.zeros(len(columns), dtype=bool)
+        mask[count_start:] = True
+        self._log1p_mask = mask
 
-        self.observation_space = gym.spaces.Box(
-            low=env.observation_space.low[:, self.filter],
-            high=env.observation_space.high[:, self.filter],
-            dtype=env.observation_space.dtype
-        )
+        # Expand the observation-space bounds so the transformed values
+        # still validate. ``log1p(N)`` is unbounded above; use a large
+        # sentinel rather than the dtype max to avoid overflow warnings
+        # in downstream code.
+        dtype = env.observation_space.dtype
+        low = env.observation_space.low.copy()
+        high = env.observation_space.high.copy()
+        high[:, mask] = np.array(20.0, dtype=dtype)  # log1p(~5e8) is ~20
+        self.observation_space = gym.spaces.Box(low=low, high=high, dtype=dtype)
 
     def observation(self, observation):
-        """Builds the observation from a method."""
-        observation[:, self.obs_log1p] = np.log1p(observation[:, self.obs_log1p])
-        observation = (observation - self.obs_subtract) * self.obs_scale
+        """Transforms the observation in-place-safe."""
+        out = np.asarray(observation, dtype=self.observation_space.dtype).copy()
+        out[:, self._log1p_mask] = np.log1p(np.maximum(out[:, self._log1p_mask], 0.0))
+        return out
 
-        # We still need to clip the data since there could be some values we didn't encounter when building
-        # the scaling factors
-        np.clip(observation, 0.0, 1.0, out=observation)
-        return observation[:, self.filter]
 
-__all__ = [NormalizeFeaturesWrapper.__name__, OptimalCseWrapper.__name__]
+class DeltaVsHeuristicRewardWrapper(gym.Wrapper):
+    """Reward-shaping wrapper: give the agent a per-episode bonus based on
+    how it performs relative to the JIT's built-in heuristic.
+
+    Rewards each step normally (via the base env), then when the episode
+    terminates adds a shaping term::
+
+        (heuristic_score - final_score) / heuristic_score
+
+    so improvements over the heuristic give a positive shaping term and
+    regressions give a negative one. This is a much cheaper reward
+    signal than :class:`OptimalCseWrapper` because it does not require
+    re-JITting with every candidate CSE at every step.
+    """
+
+    def __init__(self, env: JitCseEnv, scale: float = 1.0):
+        super().__init__(env)
+        self._scale = float(scale)
+
+    def step(self, action):
+        observation, reward, terminated, truncated, info = self.env.step(action)
+        if terminated and 'final_score' in info and 'heuristic_score' in info:
+            heuristic = info['heuristic_score']
+            final     = info['final_score']
+            if heuristic > 0:
+                # Positive when the model beats the heuristic.
+                reward += self._scale * (heuristic - final) / heuristic
+        return observation, reward, terminated, truncated, info
+
+
+__all__ = [
+    NormalizeFeaturesWrapper.__name__,
+    OptimalCseWrapper.__name__,
+    DeltaVsHeuristicRewardWrapper.__name__,
+]
+

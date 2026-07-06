@@ -55,3 +55,32 @@ def split_for_cse(methods : Sequence[MethodContext], test_percent=0.1, seed=42):
             train.extend(method_group[split:])
 
     return test, train
+
+
+def curriculum_buckets(methods: Sequence[MethodContext],
+                       thresholds: Sequence[int] = (3, 6, 10, 16)) -> list:
+    """Partition ``methods`` into curriculum tiers by candidate count.
+
+    Returns a list of method-context lists, one per tier. ``thresholds``
+    defines the (exclusive) upper bound on ``num_cse_candidate`` for
+    each tier: with the default ``(3, 6, 10, 16)`` the returned tiers
+    contain methods with 1-3, 4-6, 7-10 and 11-16 candidates respectively.
+
+    Training callers can consume tiers in order (easy first) to
+    implement a simple curriculum: warm the policy up on low-candidate
+    methods, then progressively include harder ones. Methods below the
+    ``is_acceptable_for_cse`` gate are skipped.
+    """
+    tiers: list = [[] for _ in thresholds]
+    ordered = sorted(thresholds)
+
+    for m in methods:
+        if not is_acceptable_for_cse(m):
+            continue
+        n = m.num_cse_candidate
+        for i, upper in enumerate(ordered):
+            if n <= upper:
+                tiers[i].append(m)
+                break
+
+    return tiers

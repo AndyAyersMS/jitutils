@@ -52,6 +52,11 @@ def _parse_args() -> argparse.Namespace:
                         help="How many methods to scan from the MCH looking for candidates "
                              "before giving up (default 400).")
     parser.add_argument("--algorithm", default="PPO", choices=("PPO", "A2C", "DQN"))
+    parser.add_argument("--normalize-features", action="store_true",
+                        help="Wrap the env with NormalizeFeaturesWrapper (log1p count-like features).")
+    parser.add_argument("--delta-reward", action="store_true",
+                        help="Wrap the env with DeltaVsHeuristicRewardWrapper "
+                             "(episode-end shaping term = (heuristic - final) / heuristic).")
     return parser.parse_args()
 
 
@@ -145,6 +150,7 @@ def main() -> int:
 
     print("[4/5] constructing JitCseEnv + PPO...")
     from jitml import JitCseEnv, JitCseModel  # lazy-imports torch/SB3
+    from jitml import NormalizeFeaturesWrapper, DeltaVsHeuristicRewardWrapper
     ctx = SuperPmiContext(core_root=args.core_root, mch=args.mch)
     # Load the split we just wrote; use the train side.
     _, train_ids = SuperPmiCache.get_test_train_methods(args.mch, args.core_root)
@@ -153,15 +159,21 @@ def main() -> int:
         return 1
     print(f"      training on {len(train_ids)} methods: {train_ids[:10]}...")
 
-    model = JitCseModel(args.algorithm)
+    wrappers = []
+    if args.normalize_features:
+        wrappers.append(NormalizeFeaturesWrapper)
+        print("      + NormalizeFeaturesWrapper")
+    if args.delta_reward:
+        wrappers.append(DeltaVsHeuristicRewardWrapper)
+        print("      + DeltaVsHeuristicRewardWrapper")
 
-    def _make_env():
-        return JitCseEnv(ctx, methods=train_ids)
+    model = JitCseModel(args.algorithm)
 
     print(f"[5/5] running {args.algorithm} for {args.iterations} iterations...")
     t0 = time.time()
     save_path = model.train(ctx, train_ids, args.output_dir,
-                            iterations=args.iterations, parallel=None, progress_bar=False)
+                            iterations=args.iterations, parallel=None, progress_bar=False,
+                            wrappers=wrappers)
     elapsed = time.time() - t0
 
     print(f"OK: {args.algorithm} trained {args.iterations} iters in {elapsed:.1f}s; "

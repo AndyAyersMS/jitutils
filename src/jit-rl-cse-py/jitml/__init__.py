@@ -17,6 +17,7 @@ _LAZY_EXPORTS = {
     "JitCseModel":              ("jitml.machine_learning","JitCseModel"),
     "OptimalCseWrapper":        ("jitml.wrappers",        "OptimalCseWrapper"),
     "NormalizeFeaturesWrapper": ("jitml.wrappers",        "NormalizeFeaturesWrapper"),
+    "DeltaVsHeuristicRewardWrapper": ("jitml.wrappers",   "DeltaVsHeuristicRewardWrapper"),
     "get_individual_cse_perf":  ("jitml.cse_decisions",   "get_individual_cse_perf"),
     "get_multi_cse_perf":       ("jitml.cse_decisions",   "get_multi_cse_perf"),
 }
@@ -33,7 +34,7 @@ def __getattr__(name):
 if TYPE_CHECKING:  # help static analyzers see the lazy exports
     from .jit_cse import JitCseEnv
     from .machine_learning import JitCseModel
-    from .wrappers import OptimalCseWrapper, NormalizeFeaturesWrapper
+    from .wrappers import OptimalCseWrapper, NormalizeFeaturesWrapper, DeltaVsHeuristicRewardWrapper
     from .cse_decisions import get_individual_cse_perf, get_multi_cse_perf
 
 
@@ -49,6 +50,7 @@ __all__ = [
     "JitType",
     "OptimalCseWrapper",
     "NormalizeFeaturesWrapper",
+    "DeltaVsHeuristicRewardWrapper",
     "get_individual_cse_perf",
     "get_multi_cse_perf",
 ]
