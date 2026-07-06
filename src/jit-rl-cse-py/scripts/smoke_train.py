@@ -52,6 +52,9 @@ def _parse_args() -> argparse.Namespace:
                         help="How many methods to scan from the MCH looking for candidates "
                              "before giving up (default 400).")
     parser.add_argument("--algorithm", default="PPO", choices=("PPO", "A2C", "DQN"))
+    parser.add_argument("--parallel", type=int, default=None,
+                        help="Number of parallel SubprocVecEnv workers (each spawns its own "
+                             "superpmi + JIT). Default: single-process.")
     parser.add_argument("--normalize-features", action="store_true",
                         help="Wrap the env with NormalizeFeaturesWrapper (log1p count-like features).")
     parser.add_argument("--delta-reward", action="store_true",
@@ -179,8 +182,8 @@ def main() -> int:
     print(f"[5/5] running {args.algorithm} for {args.iterations} iterations...")
     t0 = time.time()
     save_path = model.train(ctx, train_ids, args.output_dir,
-                            iterations=args.iterations, parallel=None, progress_bar=False,
-                            wrappers=wrappers)
+                            iterations=args.iterations, parallel=args.parallel,
+                            progress_bar=False, wrappers=wrappers)
     elapsed = time.time() - t0
 
     print(f"OK: {args.algorithm} trained {args.iterations} iters in {elapsed:.1f}s; "
