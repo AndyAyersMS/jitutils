@@ -487,7 +487,7 @@ class SuperPmiCache:
                 result[method.index] = method
 
         with open(filename, 'w', encoding="utf8") as f:
-            json.dump([m.dict() for m in result.values()], f)
+            json.dump([m.model_dump() for m in result.values()], f)
 
         return result
 
