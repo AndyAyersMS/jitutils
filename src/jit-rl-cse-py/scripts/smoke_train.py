@@ -96,8 +96,10 @@ def _prime_cache(mch: str, core_root: str, methods_no_cse: List[MethodContext],
 
     def dump(path: str, methods: List[MethodContext]) -> None:
         with open(path, "w", encoding="utf-8") as f:
-            # Pydantic v2 uses ``model_dump`` instead of ``dict``.
-            json.dump([m.model_dump(by_alias=False) for m in methods], f)
+            # Emit by alias so the JSON schema matches the JIT-emitted
+            # feature names (matches the format written by
+            # ``SuperPmiCache._load_all_methods``).
+            json.dump([m.model_dump(by_alias=True) for m in methods], f)
 
     dump(no_cse_file, methods_no_cse)
     dump(heuristic_file, methods_heuristic)

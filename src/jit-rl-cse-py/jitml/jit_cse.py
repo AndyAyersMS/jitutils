@@ -27,8 +27,9 @@ class JitCseEnv(gym.Env):
     observation_columns : List[str] = [f"type_{JitType(i).name.lower()}" for i in range(1, 7)] + \
         [
             "can_apply", "live_across_call", "const", "shared_const", "make_cse", "has_call", "containable",
-            "cost_ex", "cost_sz", "use_count", "def_count", "use_wt_cnt", "def_wt_cnt", "distinct_locals",
-            "local_occurrences",
+            "cost_ex", "cost_sz", "use_count", "def_count",
+            "use_wt_cnt_x100", "def_wt_cnt_x100",
+            "distinct_locals", "local_occurrences",
             "enreg_count_int", "enreg_count_float", "enreg_count_simd", "enreg_count_msk",
         ]
 
@@ -197,9 +198,13 @@ class JitCseEnv(gym.Env):
                 cse.containable
             ])
 
-            # float features
+            # float features. The two weighted counts are the JIT-emitted
+            # x100 fixed-point values; the observation preserves that scale
+            # rather than dividing by 100 so a wrapper can log1p it uniformly
+            # with the other counts.
             tensor.extend([
-                cse.cost_ex, cse.cost_sz, cse.use_count, cse.def_count, cse.use_wt_cnt, cse.def_wt_cnt,
+                cse.cost_ex, cse.cost_sz, cse.use_count, cse.def_count,
+                cse.use_wt_cnt_x100, cse.def_wt_cnt_x100,
                 cse.distinct_locals, cse.local_occurrences,
                 cse.enreg_count_int, cse.enreg_count_float, cse.enreg_count_simd, cse.enreg_count_msk,
             ])

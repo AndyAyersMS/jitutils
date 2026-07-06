@@ -27,7 +27,8 @@ class _FakeEnv(gym.Env):
             "can_apply", "live_across_call", "const", "shared_const",
             "make_cse", "has_call", "containable",
             "cost_ex", "cost_sz", "use_count", "def_count",
-            "use_wt_cnt", "def_wt_cnt", "distinct_locals", "local_occurrences",
+            "use_wt_cnt_x100", "def_wt_cnt_x100",
+            "distinct_locals", "local_occurrences",
             "enreg_count_int", "enreg_count_float", "enreg_count_simd", "enreg_count_msk",
         ]
         assert len(self.observation_columns) == FEATURES, \

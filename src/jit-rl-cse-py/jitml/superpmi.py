@@ -487,7 +487,12 @@ class SuperPmiCache:
                 result[method.index] = method
 
         with open(filename, 'w', encoding="utf8") as f:
-            json.dump([m.model_dump() for m in result.values()], f)
+            # Emit using aliases so the on-disk JSON schema matches the
+            # JIT-emitted feature names (``use_wt_cnt``, ``def_wt_cnt``)
+            # rather than the internal ``_legacy`` suffixed field names.
+            # Old jitml v1 cache files use the alias names and are still
+            # loaded via pydantic's ``populate_by_name=True``.
+            json.dump([m.model_dump(by_alias=True) for m in result.values()], f)
 
         return result
 
