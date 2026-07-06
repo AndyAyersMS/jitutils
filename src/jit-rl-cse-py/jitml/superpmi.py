@@ -279,9 +279,21 @@ class SuperPmi:
     def stop(self):
         """Closes the superpmi process."""
         if self._process is not None:
-            self._process.stdin.write(b"quit\n")
-            self._process.terminate()
-            self._process = None
+            proc, self._process = self._process, None
+            # Best-effort: write a quit request if the pipe is still open.
+            # If the process already exited or stdin was closed we get an
+            # OSError which we deliberately swallow (this is called from
+            # __del__ during interpreter shutdown).
+            try:
+                if proc.stdin is not None and not proc.stdin.closed:
+                    proc.stdin.write(b"quit\n")
+                    proc.stdin.flush()
+            except (OSError, ValueError):
+                pass
+            try:
+                proc.terminate()
+            except OSError:
+                pass
 
 class MethodKind(Enum):
     """The kind of method."""
