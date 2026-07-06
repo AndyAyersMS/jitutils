@@ -182,11 +182,14 @@ This subtree is being revived. The initial import is unmodified from
 **M1 — Bring-up**
 
 - [x] Import as a git subtree of `leculver/jitml` under jitutils.
-- [ ] Modernize Python deps (Python 3.12, pydantic v2, SB3 2.4+,
-  gymnasium 1.0).
+- [x] Modernize Python deps (Python 3.10–3.12, pydantic v2, SB3 2.3+,
+  gymnasium ≥ 0.29).
 - [ ] Verify `JitRLHook=1` streaming-SPMI round-trip against the current
-  JIT.
-- [ ] Fix any parser drift for new `JitMetrics` fields added since 2024.
+  JIT — helper CLI ready at `scripts/verify_interface.py`; awaiting a
+  matching MCH file.
+- [x] Fix any parser drift for new `JitMetrics` fields added since 2024
+  (heuristic-name regex, optional fields, precompiled regexes;
+  `tests/superpmi_parser_test.py` covers 6 representative cases).
 - [ ] End-to-end smoke train + smoke evaluate.
 
 **M2 — Evaluation harness**
@@ -198,11 +201,18 @@ This subtree is being revived. The initial import is unmodified from
 
 **M3 — Feature / interface refresh**
 
-- [ ] Audit the 19 `CSE_HeuristicRLHook` features vs. today's JIT.
+- [x] Audit the 19 `CSE_HeuristicRLHook` features vs. today's JIT
+  (source-level audit; findings in the session plan).
 - [x] Split `enreg_count` into per-register-class counts
   ([optcse.h:246](https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/optcse.h#L246)).
-- [ ] Review the `containable` feature.
-- [ ] Repoint the stale `optcse.cpp:3149` path comment at this directory.
+- [x] Review the `containable` feature (kept name, documented actual
+  semantics inline).
+- [x] Widen `use_wt_cnt` / `def_wt_cnt` precision (now emitted as
+  `use_wt_cnt_x100` / `def_wt_cnt_x100` fixed-point).
+- [x] Refold BYREF/REF/small ints into the `INT` `type` bucket.
+- [ ] Move `bb_count` out of the per-candidate feature list into a
+  method-scoped observation section.
+- [x] Repoint the stale `optcse.cpp:3149` path comment at this directory.
 
 **M4 — Feature engineering / rewards / hyperparameters**
 

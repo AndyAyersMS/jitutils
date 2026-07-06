@@ -49,17 +49,17 @@ RLHOOK_LEGACY_NO_FEATURENAMES = (
     "spmi index 4321 (MethodHash=cafebabe) for method Foo:Baz():int (Tier1)"
 )
 
-# 23-value feature payload = 1 (id) + 22 (M3 features: split enreg counts).
-# The trailing 4 slots are enreg_count_{int,float,simd,msk}.
+# 23-value feature payload = 1 (id) + 22 (M3 features: split enreg counts,
+# and use_wt_cnt / def_wt_cnt scaled at 100x fixed-point precision).
 RLHOOK_M3_WITH_FEATURE_NAMES_AND_SEQ = (
     "; Total bytes of code 42, prolog size 4, PerfScore 12.50, instruction count 8, "
     "allocated bytes for code 42, num cse 1 num cand 2 "
     "featureNames type,viable,live_across_call,const,shared_const,make_cse,has_call,"
-    "containable,cost_ex,cost_sz,use_count,def_count,use_wt_cnt,def_wt_cnt,"
+    "containable,cost_ex,cost_sz,use_count,def_count,use_wt_cnt_x100,def_wt_cnt_x100,"
     "distinct_locals,local_occurrences,bb_count,block_spread,"
     "enreg_count_int,enreg_count_float,enreg_count_simd,enreg_count_msk "
-    "features #0,1,1,0,0,0,0,0,0,1,1,1,1,10,10,1,1,1,0,3,1,0,0 "
-    "features #1,1,0,0,0,0,0,0,0,1,1,1,1,10,10,1,1,1,0,3,1,0,0 "
+    "features #0,1,1,0,0,0,0,0,0,1,1,1,1,125,50,1,1,1,0,3,1,0,0 "
+    "features #1,1,0,0,0,0,0,0,0,1,1,1,1,125,50,1,1,1,0,3,1,0,0 "
     "seq 1 "
     "spmi index 4321 (MethodHash=cafebabe) for method Foo:Baz():int (Tier1)"
 )
@@ -113,6 +113,14 @@ def test_parses_rlhook_with_featurenames_and_seq():
     assert cand0.enreg_count_simd  == 0
     assert cand0.enreg_count_msk   == 0
     assert cand0.enreg_count is None
+    # M3-format x100 fixed-point weighted counts.
+    assert cand0.use_wt_cnt_x100 == 125
+    assert cand0.def_wt_cnt_x100 == 50
+    assert cand0.use_wt_cnt_legacy is None
+    assert cand0.def_wt_cnt_legacy is None
+    # The .use_wt_cnt / .def_wt_cnt properties recover the true float weight.
+    assert cand0.use_wt_cnt == 1.25
+    assert cand0.def_wt_cnt == 0.50
     assert cand1.index == 1
     assert cand1.applied is True  # index 1 appears in `seq 1`
 
@@ -154,21 +162,32 @@ def test_extract_heuristic_name_helper():
 
 def test_legacy_enreg_count_field_still_accepted():
     """A legacy JIT that emits ``enreg_count`` (rather than the four split
-    per-register-class fields) should still parse; the value lands in the
-    ``enreg_count`` slot and the per-class fields default to zero."""
+    per-register-class fields) and truncating-int ``use_wt_cnt`` /
+    ``def_wt_cnt`` (rather than x100 fixed-point) should still parse.
+    Legacy values land in the compatibility fields and the effective
+    weighted-count properties fall back to them."""
     line = (
         "; Total bytes of code 42, prolog size 4, PerfScore 12.50, instruction count 8, "
         "allocated bytes for code 42, num cse 0 num cand 1 "
         "featureNames type,viable,live_across_call,const,shared_const,make_cse,has_call,"
         "containable,cost_ex,cost_sz,use_count,def_count,use_wt_cnt,def_wt_cnt,"
         "distinct_locals,local_occurrences,bb_count,block_spread,enreg_count "
-        "features #0,1,1,0,0,0,0,0,0,1,1,1,1,10,10,1,1,1,0,7 "
+        "features #0,1,1,0,0,0,0,0,0,1,1,1,1,10,4,1,1,1,0,7 "
         "spmi index 42 (MethodHash=0) for method Foo:Bar():int (Tier1)"
     )
     parser = _new_parser()
     ctx = parser._parse_method_context(line)
     assert len(ctx.cse_candidates) == 1
     cand = ctx.cse_candidates[0]
+    # Legacy enreg lump.
     assert cand.enreg_count == 7
     assert cand.enreg_count_int == 0
     assert cand.enreg_count_float == 0
+    # Legacy truncating weighted counts.
+    assert cand.use_wt_cnt_legacy == 10
+    assert cand.def_wt_cnt_legacy == 4
+    assert cand.use_wt_cnt_x100 == 0
+    assert cand.def_wt_cnt_x100 == 0
+    # Properties fall back to the legacy int values.
+    assert cand.use_wt_cnt == 10.0
+    assert cand.def_wt_cnt == 4.0

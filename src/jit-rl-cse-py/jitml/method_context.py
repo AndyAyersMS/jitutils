@@ -3,7 +3,7 @@ src/coreclr/jit/optcse.cpp."""
 
 from enum import Enum
 from typing import List, Optional
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 class JitType(Enum):
     """The type of a CSE candidate.  Mirrors CSE_HeuristicRLHook's enum."""
@@ -25,14 +25,26 @@ class CseCandidate(BaseModel):
     shared_const : bool
     make_cse : bool
     has_call : bool
+    # ``containable`` is a coarse whitelist of GT_ADD/GT_NOT/GT_MUL/GT_LSH that
+    # tries to signal "this expression can be folded into a downstream
+    # containment slot (e.g. LEA) on x86/x64" -- not a precise containment
+    # query. Treat as a hint, not a fact.
     containable : bool
     type : int
     cost_ex : int
     cost_sz : int
     use_count : int
     def_count : int
-    use_wt_cnt : int
-    def_wt_cnt : int
+    # Weighted use/def counts are emitted as fixed-point ints at 100x
+    # resolution (JIT weight_t is a double). Divide by 100.0 to recover
+    # the real weight. Older JIT builds emit truncating ``use_wt_cnt`` /
+    # ``def_wt_cnt`` int values instead; both are accepted for
+    # backwards-compat and the effective value is exposed via the
+    # ``use_wt_cnt`` / ``def_wt_cnt`` properties below.
+    use_wt_cnt_x100 : int = 0
+    def_wt_cnt_x100 : int = 0
+    use_wt_cnt_legacy : Optional[int] = Field(default=None, alias="use_wt_cnt")
+    def_wt_cnt_legacy : Optional[int] = Field(default=None, alias="def_wt_cnt")
     distinct_locals : int
     local_occurrences : int
     bb_count : int
@@ -48,6 +60,22 @@ class CseCandidate(BaseModel):
     enreg_count_simd  : int = 0
     enreg_count_msk   : int = 0
     enreg_count       : Optional[int] = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    @property
+    def use_wt_cnt(self) -> float:
+        """Effective weighted use count as a float (recovers precision from x100 fixed-point)."""
+        if self.use_wt_cnt_x100:
+            return self.use_wt_cnt_x100 / 100.0
+        return float(self.use_wt_cnt_legacy or 0)
+
+    @property
+    def def_wt_cnt(self) -> float:
+        """Effective weighted def count as a float (recovers precision from x100 fixed-point)."""
+        if self.def_wt_cnt_x100:
+            return self.def_wt_cnt_x100 / 100.0
+        return float(self.def_wt_cnt_legacy or 0)
 
     @field_validator('applied', 'viable', 'live_across_call', 'const', 'shared_const', 'make_cse', 'has_call',
                      'containable', mode='before')
