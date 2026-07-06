@@ -11,27 +11,53 @@ from .constants import (INVALID_ACTION_PENALTY, INVALID_ACTION_LIMIT, MAX_CSE, i
 # observation space
 JITTYPE_ONEHOT_SIZE = 6
 BOOLEAN_FEATURES = 7
-# 8 core scalar features + 4 enreg-count buckets (int/float/simd/msk).
-# The RLHook emits enreg counts split by register class rather than a
-# single lumped value; older JIT builds that emit only ``enreg_count``
-# leave the per-class buckets at zero and the aggregate is not
-# incorporated into the observation.
-FLOAT_FEATURES = 12
-FEATURES = JITTYPE_ONEHOT_SIZE + BOOLEAN_FEATURES + FLOAT_FEATURES
+# 8 core scalar features per candidate + block_spread (per-candidate).
+# The method-level features (bb_count + 4 per-class enreg counts) live
+# in a separate "method" channel of the Dict observation space, since
+# they are identical across every candidate in the same method and
+# duplicating them wastes model capacity.
+FLOAT_FEATURES_PER_CANDIDATE = 9
+FEATURES_PER_CANDIDATE = JITTYPE_ONEHOT_SIZE + BOOLEAN_FEATURES + FLOAT_FEATURES_PER_CANDIDATE
+METHOD_LEVEL_FEATURES = 5
+# Legacy alias kept so callers reading ``FEATURES`` keep working, but
+# it no longer describes the full observation once the Dict space is used.
+FEATURES = FEATURES_PER_CANDIDATE
 
 # Scale up the reward to make it more meaningful.
 REWARD_SCALE = 5.0
 
 class JitCseEnv(gym.Env):
-    """A gymnasium environment for CSE optimization selection in the JIT."""
-    observation_columns : List[str] = [f"type_{JitType(i).name.lower()}" for i in range(1, 7)] + \
-        [
-            "can_apply", "live_across_call", "const", "shared_const", "make_cse", "has_call", "containable",
-            "cost_ex", "cost_sz", "use_count", "def_count",
-            "use_wt_cnt_x100", "def_wt_cnt_x100",
-            "distinct_locals", "local_occurrences",
-            "enreg_count_int", "enreg_count_float", "enreg_count_simd", "enreg_count_msk",
-        ]
+    """A gymnasium environment for CSE optimization selection in the JIT.
+
+    Uses a Dict observation space with two channels:
+
+    * ``candidates``: shape ``(MAX_CSE, FEATURES_PER_CANDIDATE)``. One
+      row per (padded) candidate: one-hot type, booleans, per-candidate
+      scalar counts, ``block_spread``.
+    * ``method``: shape ``(METHOD_LEVEL_FEATURES,)``. Features that are
+      constant across every candidate in the method:
+      ``bb_count`` + per-register-class enreg counts.
+
+    Callers train against this env with an SB3 ``MultiInputPolicy``
+    rather than ``MlpPolicy``; ``JitCseModel._create`` picks the right
+    policy automatically based on the env's observation space.
+    """
+
+    per_candidate_columns : List[str] = [f"type_{JitType(i).name.lower()}" for i in range(1, 7)] + [
+        "can_apply", "live_across_call", "const", "shared_const",
+        "make_cse", "has_call", "containable",
+        "cost_ex", "cost_sz", "use_count", "def_count",
+        "use_wt_cnt_x100", "def_wt_cnt_x100",
+        "distinct_locals", "local_occurrences",
+        "block_spread",
+    ]
+    method_columns : List[str] = [
+        "bb_count",
+        "enreg_count_int", "enreg_count_float", "enreg_count_simd", "enreg_count_msk",
+    ]
+    # Kept for anyone who still inspects a "flat" column list (e.g. legacy
+    # notebooks). Equal to per_candidate_columns + method_columns.
+    observation_columns : List[str] = per_candidate_columns + method_columns
 
     def __init__(self, context : SuperPmiContext, methods : Optional[List[int]] = None, **kwargs):
         super().__init__(**kwargs)
@@ -44,9 +70,18 @@ class JitCseEnv(gym.Env):
         self.__superpmi : SuperPmi = None
         self.__cache : SuperPmiCache = None
         self.action_space = gym.spaces.Discrete(MAX_CSE + 1)
-        self.observation_space = gym.spaces.Box(np.zeros((MAX_CSE, FEATURES)),
-                                                np.ones((MAX_CSE, FEATURES)),
-                                                dtype=np.float32)
+        self.observation_space = gym.spaces.Dict({
+            "candidates": gym.spaces.Box(
+                low=np.zeros((MAX_CSE, FEATURES_PER_CANDIDATE), dtype=np.float32),
+                high=np.ones((MAX_CSE, FEATURES_PER_CANDIDATE), dtype=np.float32),
+                dtype=np.float32,
+            ),
+            "method": gym.spaces.Box(
+                low=np.zeros((METHOD_LEVEL_FEATURES,), dtype=np.float32),
+                high=np.ones((METHOD_LEVEL_FEATURES,), dtype=np.float32),
+                dtype=np.float32,
+            ),
+        })
 
         self.last_info : Optional[Dict[str,object]] = None
 
@@ -182,41 +217,70 @@ class JitCseEnv(gym.Env):
 
     @classmethod
     def get_observation(cls, method : MethodContext, fill=True):
-        """Builds the observation from a method without normalizing the data."""
-        tensors = []
-        for cse in method.cse_candidates:
-            tensor = []
+        """Builds the Dict observation for a method without normalizing.
 
-            # one-hot encode the type
+        Returns a ``{'candidates': (MAX_CSE, FEATURES_PER_CANDIDATE),
+        'method': (METHOD_LEVEL_FEATURES,)}`` numpy dict. The method-level
+        channel holds features that are constant across every candidate
+        of the method (``bb_count`` + per-register-class enreg counts);
+        they are read from the first candidate since the JIT emits them
+        per-candidate but with the same value each time.
+        """
+        candidate_rows: List[List[float]] = []
+        for cse in method.cse_candidates:
+            row: List[float] = []
+
+            # one-hot encode the type (JitType 1..6 -> six slots)
             one_hot = [0.0] * 6
-            one_hot[cse.type - 1] = 1.0
-            tensor.extend(one_hot)
+            if 1 <= cse.type <= 6:
+                one_hot[cse.type - 1] = 1.0
+            row.extend(one_hot)
 
             # boolean features
-            tensor.extend([
-                cse.can_apply, cse.live_across_call, cse.const, cse.shared_const, cse.make_cse, cse.has_call,
-                cse.containable
+            row.extend([
+                float(cse.can_apply), float(cse.live_across_call), float(cse.const),
+                float(cse.shared_const), float(cse.make_cse), float(cse.has_call),
+                float(cse.containable),
             ])
 
-            # float features. The two weighted counts are the JIT-emitted
-            # x100 fixed-point values; the observation preserves that scale
-            # rather than dividing by 100 so a wrapper can log1p it uniformly
-            # with the other counts.
-            tensor.extend([
-                cse.cost_ex, cse.cost_sz, cse.use_count, cse.def_count,
-                cse.use_wt_cnt_x100, cse.def_wt_cnt_x100,
-                cse.distinct_locals, cse.local_occurrences,
-                cse.enreg_count_int, cse.enreg_count_float, cse.enreg_count_simd, cse.enreg_count_msk,
+            # per-candidate scalar features. The two weighted counts are
+            # the JIT-emitted x100 fixed-point values; the observation
+            # preserves that scale rather than dividing by 100 so a
+            # wrapper can log1p it uniformly with the other counts.
+            row.extend([
+                float(cse.cost_ex), float(cse.cost_sz),
+                float(cse.use_count), float(cse.def_count),
+                float(cse.use_wt_cnt_x100), float(cse.def_wt_cnt_x100),
+                float(cse.distinct_locals), float(cse.local_occurrences),
+                float(cse.block_spread),
             ])
 
-            tensors.append(tensor)
+            candidate_rows.append(row)
 
         if fill:
-            while len(tensors) < MAX_CSE:
-                tensors.append([0.0] * FEATURES)
+            pad = [0.0] * FEATURES_PER_CANDIDATE
+            while len(candidate_rows) < MAX_CSE:
+                candidate_rows.append(pad)
 
-        observation = np.vstack(tensors)
-        return observation
+        candidates = (np.vstack(candidate_rows) if candidate_rows
+                      else np.zeros((MAX_CSE, FEATURES_PER_CANDIDATE))).astype(np.float32)
+
+        # Method-level features: bb_count + per-class enreg counts. These
+        # are the same for every candidate; read the first one that has
+        # a value. Fall back to zeros if the method has no candidates.
+        if method.cse_candidates:
+            first = method.cse_candidates[0]
+            method_arr = np.array([
+                first.bb_count,
+                first.enreg_count_int,
+                first.enreg_count_float,
+                first.enreg_count_simd,
+                first.enreg_count_msk,
+            ], dtype=np.float32)
+        else:
+            method_arr = np.zeros(METHOD_LEVEL_FEATURES, dtype=np.float32)
+
+        return {"candidates": candidates, "method": method_arr}
 
 
     def _jit_method_with_cleanup(self, m_id, *args, **kwargs):

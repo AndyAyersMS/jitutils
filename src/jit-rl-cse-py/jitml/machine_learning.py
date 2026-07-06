@@ -55,10 +55,21 @@ class JitCseModel:
 
     def action_probabilities(self, obs):
         """Gets the probability of every action."""
-        obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self._model.device)
+        obs_tensor = self._obs_to_tensor(obs)
         action_distribution = self._model.policy.get_distribution(obs_tensor)
         probs = action_distribution.distribution.probs
         return probs.cpu().detach().numpy()[0]
+
+    def _obs_to_tensor(self, obs):
+        """Convert a raw env observation (Box array or Dict of arrays)
+        into the batched torch tensor(s) the SB3 policy expects."""
+        device = self._model.device
+        if isinstance(obs, dict):
+            return {
+                k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(device)
+                for k, v in obs.items()
+            }
+        return torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
 
     def train(self, spmi_context : SuperPmiContext, training_methods : List[int], output_dir : str,
               iterations = None, parallel = None, progress_bar = True,
@@ -108,10 +119,13 @@ class JitCseModel:
 
     def _create(self, env, **kwargs):
         alg = self.__get_algorithm()
+        # SB3 needs MultiInputPolicy for Dict observation spaces and
+        # MlpPolicy for flat Box spaces.
+        policy = "MultiInputPolicy" if isinstance(env.observation_space, gym.spaces.Dict) else "MlpPolicy"
         if alg == PPO:
-            return alg('MlpPolicy', env, device=self.device, ent_coef=self.ent_coef, verbose=self.verbose, **kwargs)
+            return alg(policy, env, device=self.device, ent_coef=self.ent_coef, verbose=self.verbose, **kwargs)
 
-        return alg('MlpPolicy', env, device=self.device, verbose=self.verbose, **kwargs)
+        return alg(policy, env, device=self.device, verbose=self.verbose, **kwargs)
 
     def __get_algorithm(self):
         match self.algorithm:

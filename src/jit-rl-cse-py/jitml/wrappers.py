@@ -77,7 +77,7 @@ class OptimalCseWrapper(gym.Wrapper):
 
 
 class NormalizeFeaturesWrapper(gym.ObservationWrapper):
-    """Apply ``log1p`` to count-like features in the observation tensor.
+    """Apply ``log1p`` to count-like features in the observation.
 
     Rationale: the raw features emitted by ``CSE_HeuristicRLHook`` mix
     boolean / one-hot signals (already in a small range) with count-like
@@ -87,33 +87,64 @@ class NormalizeFeaturesWrapper(gym.ObservationWrapper):
     training because gradients explode. Applying ``log1p`` compresses
     each count into a small range without dataset-specific statistics.
 
-    This wrapper deliberately does NOT drop any features -- that mixed
-    responsibility caused the original wrapper to silently break the
-    observation shape and prevent training.
+    Supports both the Dict observation space (candidates + method
+    channels) currently produced by :class:`JitCseEnv` and the older
+    flat Box observation space, in case a wrapper stack undoes the
+    Dict grouping.
     """
 
     def __init__(self, env: JitCseEnv):
         super().__init__(env)
 
-        columns = list(env.unwrapped.observation_columns)
-        # Everything after ``containable`` is a count-like feature.
-        count_start = columns.index("containable") + 1
-        mask = np.zeros(len(columns), dtype=bool)
-        mask[count_start:] = True
-        self._log1p_mask = mask
+        unwrapped = env.unwrapped
+        space = env.observation_space
 
-        # Expand the observation-space bounds so the transformed values
-        # still validate. ``log1p(N)`` is unbounded above; use a large
-        # sentinel rather than the dtype max to avoid overflow warnings
-        # in downstream code.
-        dtype = env.observation_space.dtype
-        low = env.observation_space.low.copy()
-        high = env.observation_space.high.copy()
-        high[:, mask] = np.array(20.0, dtype=dtype)  # log1p(~5e8) is ~20
-        self.observation_space = gym.spaces.Box(low=low, high=high, dtype=dtype)
+        if isinstance(space, gym.spaces.Dict):
+            # Build a per-channel log1p mask.
+            per_cand_cols = list(unwrapped.per_candidate_columns)
+            cand_mask = np.zeros(len(per_cand_cols), dtype=bool)
+            cand_mask[per_cand_cols.index("containable") + 1:] = True
+            self._is_dict = True
+            self._cand_mask = cand_mask
+            # All method-level features are counts.
+            self._method_mask = np.ones(len(unwrapped.method_columns), dtype=bool)
+
+            cand_space = space.spaces["candidates"]
+            method_space = space.spaces["method"]
+            dtype = cand_space.dtype
+            high_c = cand_space.high.copy()
+            high_c[:, cand_mask] = np.array(20.0, dtype=dtype)  # log1p(~5e8) ~ 20
+            high_m = method_space.high.copy()
+            high_m[self._method_mask] = np.array(20.0, dtype=dtype)
+            self.observation_space = gym.spaces.Dict({
+                "candidates": gym.spaces.Box(low=cand_space.low, high=high_c, dtype=dtype),
+                "method":     gym.spaces.Box(low=method_space.low, high=high_m, dtype=dtype),
+            })
+        else:
+            # Legacy flat-observation path.
+            columns = list(unwrapped.observation_columns)
+            count_start = columns.index("containable") + 1
+            mask = np.zeros(len(columns), dtype=bool)
+            mask[count_start:] = True
+            self._is_dict = False
+            self._log1p_mask = mask
+
+            dtype = space.dtype
+            low = space.low.copy()
+            high = space.high.copy()
+            high[:, mask] = np.array(20.0, dtype=dtype)
+            self.observation_space = gym.spaces.Box(low=low, high=high, dtype=dtype)
 
     def observation(self, observation):
-        """Transforms the observation in-place-safe."""
+        """Transforms the observation in place-safe."""
+        if self._is_dict:
+            dtype = self.observation_space.spaces["candidates"].dtype
+            cand = np.asarray(observation["candidates"], dtype=dtype).copy()
+            method = np.asarray(observation["method"], dtype=dtype).copy()
+            cand[:, self._cand_mask] = np.log1p(np.maximum(cand[:, self._cand_mask], 0.0))
+            method[self._method_mask] = np.log1p(np.maximum(method[self._method_mask], 0.0))
+            return {"candidates": cand, "method": method}
+
         out = np.asarray(observation, dtype=self.observation_space.dtype).copy()
         out[:, self._log1p_mask] = np.log1p(np.maximum(out[:, self._log1p_mask], 0.0))
         return out
