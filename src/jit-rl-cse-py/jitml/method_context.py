@@ -61,6 +61,33 @@ class CseCandidate(BaseModel):
     enreg_count_msk   : int = 0
     enreg_count       : Optional[int] = None
 
+    # Tier 1-2 features exposed by the JIT alongside the existing 22.
+    # All default to 0 so cached JSON produced by older JIT builds still
+    # loads. Newly-primed caches will populate them.
+    #
+    # * ``log_use_wt_x1000`` / ``log_def_wt_x1000``: weighted use/def
+    #   counts on a log scale (deMinimusAdj + log(max(1e-3, wt))), x1000
+    #   fixed-point. Non-negative. Recover as
+    #   ``log_use_wt_x1000 / 1000.0`` which is ``log(max(1e-3, wt)/1e-3)``.
+    # * ``const_and_live`` / ``const_and_min_cost`` / ``min_cost_and_live``
+    #   / ``containable_and_low_cost``: joint booleans that the JIT's
+    #   parameterized heuristic feature vector uses.
+    # * ``live_across_call_lsra``: a strictly-more-precise version of
+    #   ``live_across_call`` that walks the blocks between the CSE's
+    #   min/max postorder positions and checks BBF_HAS_CALL.
+    # * ``block_spread_x1000_per_bb``: ``block_spread`` normalized by
+    #   ``bb_count``, at x1000 fixed-point (0..1000). Removes the "large
+    #   vs small method" scale difference that raw ``block_spread``
+    #   carries.
+    log_use_wt_x1000            : int  = 0
+    log_def_wt_x1000            : int  = 0
+    const_and_live              : bool = False
+    const_and_min_cost          : bool = False
+    min_cost_and_live           : bool = False
+    containable_and_low_cost    : bool = False
+    live_across_call_lsra       : bool = False
+    block_spread_x1000_per_bb   : int  = 0
+
     model_config = ConfigDict(populate_by_name=True)
 
     @property
@@ -78,7 +105,8 @@ class CseCandidate(BaseModel):
         return float(self.def_wt_cnt_legacy or 0)
 
     @field_validator('applied', 'viable', 'live_across_call', 'const', 'shared_const', 'make_cse', 'has_call',
-                     'containable', mode='before')
+                     'containable', 'const_and_live', 'const_and_min_cost', 'min_cost_and_live',
+                     'containable_and_low_cost', 'live_across_call_lsra', mode='before')
     @classmethod
     def validate_bool(cls, v):
         """Validates that the value is a boolean or is a 0 or 1."""
@@ -111,6 +139,22 @@ class MethodContext(BaseModel):
     heuristic : str = ""
     cses_chosen : List[int] = []
     cse_candidates : List[CseCandidate] = []
+    # Method-level features surfaced by CSE_HeuristicRLHook via a new
+    # ``method,<v1>,<v2>,...`` line. All default to 0 so older cached
+    # JSON produced by pre-Tier-1 JIT builds still loads. See
+    # ``CSE_HeuristicRLHook::s_methodFeatureNames`` for the ordering.
+    #
+    # * ``aggressive_ref_cnt_x1000`` / ``moderate_ref_cnt_x1000``: the
+    #   promotion cutoffs the hand-tuned heuristic uses, at x1000
+    #   fixed-point. Recover as ``value / 1000.0``.
+    # * ``large_frame`` / ``huge_frame``: frame-size class flags.
+    # * ``code_opt_kind``: 0/1/2 = BLENDED/SMALL/FAST from the JIT's
+    #   Compiler::codeOptimize enum.
+    aggressive_ref_cnt_x1000 : int  = 0
+    moderate_ref_cnt_x1000   : int  = 0
+    large_frame              : bool = False
+    huge_frame               : bool = False
+    code_opt_kind            : int  = 0
 
     def __str__(self):
         return f"{self.index}: {self.name}"
@@ -122,6 +166,15 @@ class MethodContext(BaseModel):
         if v < 0:
             raise ValueError("perf_score must not be negative")
         return v
+
+    @field_validator('large_frame', 'huge_frame', mode='before')
+    @classmethod
+    def _validate_frame_bool(cls, v):
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int) and v in (0, 1):
+            return bool(v)
+        raise ValueError(f"Value must be either 1, 0, or a boolean, got {v}")
 
 class CSEDecision(BaseModel):
     """A common format for storing the outcome of choosing a specific CSE decision."""

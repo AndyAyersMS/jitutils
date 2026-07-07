@@ -49,6 +49,7 @@ class SuperPmi:
         verbosity is the verbosity level of the superpmi process. Default is 'q'."""
         self._process = None
         self._feature_names = None
+        self._method_feature_names = None
         self.mch = mch
         self.core_root = core_root
 
@@ -186,16 +187,25 @@ class SuperPmi:
     _RE_NUM_CSE           = re.compile(r'num cse (\d+)')
     _RE_NUM_CAND          = re.compile(r'num cand (\d+)')
     # Everything after "num cand N ": may contain a heuristic name, then
-    # optional " featureNames ...", " features #<idx>,...", " seq n,n,...",
-    # and always ends with " spmi index N (MethodHash=...) for method ...".
+    # optional " featureNames ...", " methodFeatureNames ...",
+    # " method,...", " features #<idx>,...", " seq n,n,...", and always
+    # ends with " spmi index N (MethodHash=...) for method ...".
     _RE_POST_NUM_CAND     = re.compile(r'num cand \d+(.*)$')
     _RE_SEQ               = re.compile(r'seq ([0-9,]+)(?= spmi index )')
     _RE_FEATURE_CANDIDATE = re.compile(r'features #([0-9,]+)')
     _RE_FEATURE_NAMES     = re.compile(r'featureNames ([^ ]+)')
+    _RE_METHOD_FEATURE_NAMES = re.compile(r'methodFeatureNames ([^ ]+)')
+    # Method-level feature values: leading ' method,<v1>,<v2>,...' up to
+    # the next space or end of line. Uses a lookahead so the trailing
+    # ' features #...' / ' seq ...' / ' spmi index ...' tokens don't get
+    # slurped into the value list.
+    _RE_METHOD_FEATURES   = re.compile(r' method,([0-9,\-]+)(?=(?: features #| seq | spmi index ))')
 
     # Tail markers, in order they may appear after the heuristic name.
     _POST_NUM_CAND_TAIL_MARKERS = (
         ' featureNames ',
+        ' methodFeatureNames ',
+        ' method,',
         ' features #',
         ' seq ',
         ' spmi index ',
@@ -212,6 +222,13 @@ class SuperPmi:
                 # positional slots line up with `_feature_names`.
                 self._feature_names.insert(0, 'id')
 
+        # Discover the method-level feature names header the first time
+        # we see it. Optional; older JIT builds do not emit this.
+        if self._method_feature_names is None:
+            mfn_match = self._RE_METHOD_FEATURE_NAMES.search(line)
+            if mfn_match is not None:
+                self._method_feature_names = mfn_match.group(1).split(',')
+
         properties = {}
         properties['index']             = int(self._RE_INDEX.search(line).group(1))
         properties['name']              = self._RE_NAME.search(line).group(1)
@@ -224,6 +241,17 @@ class SuperPmi:
         properties['num_cse']           = int(self._RE_NUM_CSE.search(line).group(1))
         properties['num_cse_candidate'] = int(self._RE_NUM_CAND.search(line).group(1))
         properties['heuristic']         = self._extract_heuristic_name(line)
+
+        # Method-level feature values (optional -- only present when the
+        # JIT is invoked with a JitRLHook that supports the ``method``
+        # line). If we have positional names, zip them with the payload
+        # and add each recognized key directly to ``properties`` so the
+        # pydantic MethodContext gets them.
+        mf_match = self._RE_METHOD_FEATURES.search(line)
+        if mf_match is not None and self._method_feature_names is not None:
+            values = mf_match.group(1).split(',')
+            for name, value in zip(self._method_feature_names, values):
+                properties[name] = int(value)
 
         seq = self._RE_SEQ.search(line)
         if seq is not None:

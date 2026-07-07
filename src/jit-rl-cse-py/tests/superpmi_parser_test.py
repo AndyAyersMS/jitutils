@@ -21,8 +21,9 @@ from jitml.superpmi import SuperPmi  # noqa: E402
 def _new_parser() -> SuperPmi:
     """Return a bare SuperPmi with only the parse-state fields initialized."""
     parser = SuperPmi.__new__(SuperPmi)
-    parser._process = None        # type: ignore[attr-defined]
-    parser._feature_names = None  # type: ignore[attr-defined]
+    parser._process = None               # type: ignore[attr-defined]
+    parser._feature_names = None         # type: ignore[attr-defined]
+    parser._method_feature_names = None  # type: ignore[attr-defined]
     return parser
 
 
@@ -191,3 +192,99 @@ def test_legacy_enreg_count_field_still_accepted():
     # Properties fall back to the legacy int values.
     assert cand.use_wt_cnt == 10.0
     assert cand.def_wt_cnt == 4.0
+
+
+# 31-value feature payload = 1 (id) + 30 (Tier-1 features). Adds the
+# 8 new per-candidate slots (log_use_wt_x1000, log_def_wt_x1000,
+# 4 joint bools, live_across_call_lsra, block_spread_x1000_per_bb)
+# and the new method-level line.
+RLHOOK_TIER1_WITH_METHOD_LINE = (
+    "; Total bytes of code 239, prolog size 32, PerfScore 148.00, instruction count 70, "
+    "allocated bytes for code 239, num cse 0 num cand 2 "
+    "featureNames type,viable,live_across_call,const,shared_const,make_cse,has_call,"
+    "containable,cost_ex,cost_sz,use_count,def_count,use_wt_cnt_x100,def_wt_cnt_x100,"
+    "distinct_locals,local_occurrences,bb_count,block_spread,"
+    "enreg_count_int,enreg_count_float,enreg_count_simd,enreg_count_msk,"
+    "log_use_wt_x1000,log_def_wt_x1000,const_and_live,const_and_min_cost,"
+    "min_cost_and_live,containable_and_low_cost,live_across_call_lsra,"
+    "block_spread_x1000_per_bb "
+    "methodFeatureNames aggressive_ref_cnt_x1000,moderate_ref_cnt_x1000,large_frame,"
+    "huge_frame,code_opt_kind "
+    "method,50000,100000,0,0,0 "
+    "features #1,2,1,1,1,0,0,0,0,3,10,1,1,40000,10000,0,0,7,2,10,0,0,0,"
+    "12899,11513,1,0,0,0,1,286 "
+    "features #2,2,1,1,0,0,0,0,0,2,3,1,1,40000,80000,1,1,7,1,10,0,0,0,"
+    "12899,13592,0,0,1,0,1,143 "
+    "spmi index 1 (MethodHash=df1777a5) for method System.AppContext:Setup(ptr,ptr,int,ptr) (FullOpts)"
+)
+
+
+def test_parses_tier1_line_with_method_features():
+    """The Tier-1 JIT emits a `methodFeatureNames` header plus a `method`
+    values line plus 30-value per-candidate feature vectors. All the new
+    fields must decode into the pydantic model correctly."""
+    parser = _new_parser()
+    ctx = parser._parse_method_context(RLHOOK_TIER1_WITH_METHOD_LINE)
+
+    # Method-level features (values captured from a real invocation --
+    # 50/100 are the BB_UNITY_WEIGHT/2 and BB_UNITY_WEIGHT minimum floors).
+    assert ctx.aggressive_ref_cnt_x1000 == 50000
+    assert ctx.moderate_ref_cnt_x1000 == 100000
+    assert ctx.large_frame is False
+    assert ctx.huge_frame is False
+    assert ctx.code_opt_kind == 0  # BLENDED_CODE
+
+    # Per-candidate features: the 8 new ones must all decode.
+    assert len(ctx.cse_candidates) == 2
+    cand0 = ctx.cse_candidates[0]
+    assert cand0.log_use_wt_x1000 == 12899
+    assert cand0.log_def_wt_x1000 == 11513
+    # (const=1, live=1) -> const_and_live=1; cost=3 -> not min_cost.
+    assert cand0.const_and_live is True
+    assert cand0.const_and_min_cost is False
+    assert cand0.min_cost_and_live is False
+    assert cand0.containable_and_low_cost is False
+    assert cand0.live_across_call_lsra is True
+    # block_spread=2, bb_count=7 -> round(2 * 1000 / 7) = 286
+    assert cand0.block_spread_x1000_per_bb == 286
+
+    cand1 = ctx.cse_candidates[1]
+    # (const=1, cost=2 which is MIN_CSE_COST+1 -> not min_cost, but low_cost)
+    # -> min_cost_and_live shows the JIT actually says 1 here (see raw dump);
+    # trust the payload.
+    assert cand1.min_cost_and_live is True
+
+
+def test_method_feature_names_are_learned_and_cached():
+    """The `methodFeatureNames` header should be captured the first time
+    we see it, then reused on subsequent lines that only carry the
+    `method,...` values."""
+    parser = _new_parser()
+    parser._parse_method_context(RLHOOK_TIER1_WITH_METHOD_LINE)
+    assert parser._method_feature_names is not None
+    assert "aggressive_ref_cnt_x1000" in parser._method_feature_names
+    assert "code_opt_kind" in parser._method_feature_names
+
+    # Second call reuses the cached names.
+    ctx = parser._parse_method_context(RLHOOK_TIER1_WITH_METHOD_LINE)
+    assert ctx.aggressive_ref_cnt_x1000 == 50000
+
+
+def test_tier1_line_still_parses_without_method_line():
+    """A JIT build that emits the new per-candidate features but not
+    the `method,...` values line (e.g. mid-transition source tree)
+    should still decode. Method-level fields fall back to defaults (0)."""
+    # Same as RLHOOK_TIER1_WITH_METHOD_LINE but without the `method,...` chunk.
+    line = RLHOOK_TIER1_WITH_METHOD_LINE.replace(
+        "method,50000,100000,0,0,0 ", ""
+    )
+    parser = _new_parser()
+    ctx = parser._parse_method_context(line)
+    # Defaults preserve backward compat.
+    assert ctx.aggressive_ref_cnt_x1000 == 0
+    assert ctx.moderate_ref_cnt_x1000 == 0
+    assert ctx.large_frame is False
+    assert ctx.code_opt_kind == 0
+    # Per-candidate features still decode.
+    assert len(ctx.cse_candidates) == 2
+    assert ctx.cse_candidates[0].log_use_wt_x1000 == 12899
