@@ -143,12 +143,10 @@ def main() -> int:
             self._current_stage = -1
 
         def _current_desired_stage(self) -> int:
-            step = self.num_timesteps
-            s = 0
+            step = self.model.num_timesteps
             for i, t in enumerate(self._thresholds[1:], start=1):
                 if step < t:
                     return i - 1
-                s = i
             return len(self._stage_pools) - 1
 
         def _apply_stage(self, stage: int) -> None:
@@ -159,7 +157,7 @@ def main() -> int:
                 if hasattr(unwrapped, "methods"):
                     unwrapped.methods = list(pool)
             if self.verbose:
-                print(f"      [curriculum] step={self.num_timesteps} "
+                print(f"      [curriculum] step={self.model.num_timesteps} "
                       f"stage {self._current_stage} -> {stage}, pool={len(pool)} methods",
                       flush=True)
             self._current_stage = stage
