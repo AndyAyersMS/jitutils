@@ -324,10 +324,24 @@ class SuperPmi:
                 pass
 
 class MethodKind(Enum):
-    """The kind of method."""
-    UNKNOWN = 0
-    NO_CSE = 1
+    """The kind of method perf-score to compare against.
+
+    * ``NO_CSE``: the JIT compiles the method with zero CSEs applied.
+      Baseline "what would this method score without CSE at all".
+    * ``HEURISTIC``: the JIT's default hand-tuned ``CSE_Heuristic``
+      (no config settings). This is the "beat the baseline" target.
+    * ``RL2020``: the JIT's built-in linear parameterized heuristic
+      (``CSE_HeuristicParameterized``) running in greedy mode with
+      ``s_defaultParameters`` -- i.e. the 2020 PolicyGradient-trained
+      RL model whose parameter vector ships in the JIT source. See
+      ``optcse.cpp:2314`` for the training run summary. Enabled via
+      ``JitRLCSEGreedy=1``. Useful as a stronger comparison point
+      than the hand-tuned default.
+    """
+    UNKNOWN   = 0
+    NO_CSE    = 1
     HEURISTIC = 2
+    RL2020    = 3
 
 class SuperPmiCache:
     """A wrapper around superpmi that caches results to file."""
@@ -344,6 +358,12 @@ class SuperPmiCache:
 
             self.no_cse = future_no_cse.result()
             self.heuristic = future_heuristic.result()
+
+        # ``rl2020`` is populated lazily via ``jit_method(..., MethodKind.RL2020)``
+        # (or via ``_load_all_methods`` on demand). Priming it eagerly would
+        # double the SuperPMI startup cost, and most callers only need the
+        # HEURISTIC baseline.
+        self.rl2020 : Dict[int, MethodContext] = {}
 
         self.test_methods, self.train_methods = self._get_test_train()
 
@@ -428,6 +448,13 @@ class SuperPmiCache:
                 self.heuristic[method_index] = result
                 return result
 
+            case MethodKind.RL2020:
+                # CSE_HeuristicParameterized in greedy mode, using the
+                # 2020-trained s_defaultParameters that ship in the JIT.
+                result = spmi.jit_method(method_index, JitMetrics=1, JitRLCSEGreedy=1)
+                self.rl2020[method_index] = result
+                return result
+
             case list() as indices:
                 return spmi.jit_method(method_index, JitMetrics=1, JitRLHook=1, JitRLHookCSEDecisions=indices)
 
@@ -506,6 +533,10 @@ class SuperPmiCache:
             case MethodKind.HEURISTIC:
                 jit_flags['JitMetrics'] = 1
 
+            case MethodKind.RL2020:
+                # Greedy parameterized heuristic (uses s_defaultParameters).
+                jit_flags['JitRLCSEGreedy'] = 1
+
             case _:
                 raise ValueError("kind must be a known kind.")
 
@@ -526,10 +557,13 @@ class SuperPmiCache:
 
     def _get_cache(self, kind : MethodKind) -> Dict[int, MethodContext]:
         """Gets the cache for the specified kind."""
-        if kind == MethodKind.UNKNOWN:
-            raise ValueError("kind must be a known kind.")
-
-        return self.no_cse if kind == MethodKind.NO_CSE else self.heuristic
+        if kind == MethodKind.NO_CSE:
+            return self.no_cse
+        if kind == MethodKind.HEURISTIC:
+            return self.heuristic
+        if kind == MethodKind.RL2020:
+            return self.rl2020
+        raise ValueError("kind must be a known kind.")
 
 __all__ = [
     SuperPmiContext.__name__,
