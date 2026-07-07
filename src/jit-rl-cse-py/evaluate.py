@@ -31,6 +31,7 @@ import pandas as pd
 import tqdm
 
 from jitml import JitCseEnv, JitCseModel, MethodContext, SuperPmi, SuperPmiCache
+from jitml.superpmi import MethodKind
 from train import validate_core_root
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,11 @@ class RolloutRow:
     heuristic_prolog_size: int
     rl_prolog_size: int
     status: str                           # "ok", "jit_failed", "no_candidates"
+    # Optional RL2020 baseline (populated only when --include-rl2020 is set;
+    # NaN otherwise). RL2020 = CSE_HeuristicParameterized with
+    # s_defaultParameters -- the 2020-trained JIT-internal RL model.
+    rl2020_perfscore: float = float("nan")
+    pct_delta_vs_rl2020: float = float("nan")
 
 
 def _greedy_action(jitrl: JitCseModel, method: MethodContext, can_terminate: bool) -> Optional[int]:
@@ -80,8 +86,15 @@ def _greedy_action(jitrl: JitCseModel, method: MethodContext, can_terminate: boo
     raise ValueError("no valid action; policy is degenerate for this state")
 
 
-def _rollout(superpmi: SuperPmi, jitrl: JitCseModel, method_id: int) -> RolloutRow:
-    """Perform a single greedy rollout for one method and return the row."""
+def _rollout(superpmi: SuperPmi, jitrl: JitCseModel, method_id: int,
+             include_rl2020: bool = False) -> RolloutRow:
+    """Perform a single greedy rollout for one method and return the row.
+
+    If ``include_rl2020`` is True, also compile the method with the JIT's
+    built-in parameterized heuristic (``JitRLCSEGreedy=1``, i.e. the 2020
+    trained RL model) and fill in the ``rl2020_perfscore`` /
+    ``pct_delta_vs_rl2020`` columns.
+    """
     heuristic = superpmi.jit_method(method_id, JitMetrics=1)
     no_cse    = superpmi.jit_method(method_id, JitMetrics=1, JitRLHook=1, JitRLHookCSEDecisions=[])
 
@@ -92,6 +105,12 @@ def _rollout(superpmi: SuperPmi, jitrl: JitCseModel, method_id: int) -> RolloutR
                           pct_delta_vs_heuristic=0.0, heuristic_total_bytes=0,
                           rl_total_bytes=0, heuristic_instr_count=0, rl_instr_count=0,
                           heuristic_prolog_size=0, rl_prolog_size=0, status="jit_failed")
+
+    rl2020_score = float("nan")
+    if include_rl2020:
+        rl2020_ctx = superpmi.jit_method(method_id, JitMetrics=1, JitRLCSEGreedy=1)
+        if rl2020_ctx is not None:
+            rl2020_score = rl2020_ctx.perf_score
 
     chosen: List[int] = []
     curr: MethodContext = no_cse
@@ -120,7 +139,10 @@ def _rollout(superpmi: SuperPmi, jitrl: JitCseModel, method_id: int) -> RolloutR
                               rl_instr_count=curr.instruction_count,
                               heuristic_prolog_size=heuristic.prolog_size,
                               rl_prolog_size=curr.prolog_size,
-                              status="jit_failed")
+                              status="jit_failed",
+                              rl2020_perfscore=rl2020_score,
+                              pct_delta_vs_rl2020=_pct(curr.perf_score, rl2020_score)
+                                                    if not math.isnan(rl2020_score) else float("nan"))
         curr = step
 
     status = "ok" if chosen else "no_candidates"
@@ -138,11 +160,14 @@ def _rollout(superpmi: SuperPmi, jitrl: JitCseModel, method_id: int) -> RolloutR
                       rl_instr_count=curr.instruction_count,
                       heuristic_prolog_size=heuristic.prolog_size,
                       rl_prolog_size=curr.prolog_size,
-                      status=status)
+                      status=status,
+                      rl2020_perfscore=rl2020_score,
+                      pct_delta_vs_rl2020=_pct(curr.perf_score, rl2020_score)
+                                            if not math.isnan(rl2020_score) else float("nan"))
 
 
 def _pct(rl: float, baseline: float) -> float:
-    if baseline == 0.0:
+    if baseline == 0.0 or math.isnan(baseline):
         return 0.0
     return (rl - baseline) / baseline
 
@@ -152,13 +177,13 @@ def _pct(rl: float, baseline: float) -> float:
 # ---------------------------------------------------------------------------
 
 def _rollout_all(superpmi: SuperPmi, jitrl: JitCseModel, method_ids: Iterable[int],
-                 label: str) -> pd.DataFrame:
+                 label: str, include_rl2020: bool = False) -> pd.DataFrame:
     method_ids = list(method_ids)
     rows: List[RolloutRow] = []
     for m_id in tqdm.tqdm(method_ids, desc=f"Evaluating {label}", colour='green',
                           ncols=max(shutil.get_terminal_size().columns - 8, 40),
                           ascii=True):
-        rows.append(_rollout(superpmi, jitrl, m_id))
+        rows.append(_rollout(superpmi, jitrl, m_id, include_rl2020=include_rl2020))
 
     return pd.DataFrame([r.__dict__ for r in rows])
 
@@ -201,6 +226,25 @@ def _summarize(df: pd.DataFrame, label: str) -> None:
         print(f"  geometric mean code-size ratio:         {gm:.5f}  "
               f"({(gm - 1.0) * 100:+.3f}%)")
 
+    # Optional RL2020 baseline comparison. Only shown when the DataFrame
+    # actually carries non-NaN rl2020_perfscore values (i.e., evaluate
+    # was run with --include-rl2020).
+    if "rl2020_perfscore" in ok.columns and ok["rl2020_perfscore"].notna().any():
+        rl2020_ok = ok[ok.rl2020_perfscore.notna()]
+        r_improved  = rl2020_ok[rl2020_ok.rl_perfscore < rl2020_ok.rl2020_perfscore]
+        r_same      = rl2020_ok[rl2020_ok.rl_perfscore == rl2020_ok.rl2020_perfscore]
+        r_regressed = rl2020_ok[rl2020_ok.rl_perfscore > rl2020_ok.rl2020_perfscore]
+        rl2020_pct_mean = rl2020_ok.pct_delta_vs_rl2020.mean()
+        rl2020_ratios = (rl2020_ok.rl_perfscore / rl2020_ok.rl2020_perfscore).replace(
+            [np.inf, -np.inf], np.nan).dropna()
+        rl2020_ratios = rl2020_ratios[rl2020_ratios > 0]
+        r_geo = math.exp(np.log(rl2020_ratios).mean()) if not rl2020_ratios.empty else float("nan")
+        print(f"  vs. RL2020:   better={len(r_improved)}  same={len(r_same)}  worse={len(r_regressed)}")
+        print(f"  arithmetic mean pct delta vs RL2020:    {rl2020_pct_mean * 100:+.3f}%  "
+              f"(negative = better)")
+        print(f"  geometric mean ratio (rl/rl2020):       {r_geo:.5f}  "
+              f"({(r_geo - 1.0) * 100:+.3f}%)")
+
 
 def _resolve_methods(cache: SuperPmiCache, test_seed: Optional[int],
                      test_only: bool, limit: Optional[int]):
@@ -241,6 +285,11 @@ def _parse_args() -> argparse.Namespace:
                         help="Skip the train-set rollout; useful when you only care about held-out data.")
     parser.add_argument("--limit", type=int, default=None,
                         help="Optionally cap each of train/test to at most N methods.")
+    parser.add_argument("--include-rl2020", action="store_true",
+                        help="Also compile each method with the JIT's built-in parameterized "
+                             "heuristic (JitRLCSEGreedy=1, i.e. the 2020-trained RL model) "
+                             "and add a ``rl_perfscore vs rl2020_perfscore`` comparison to "
+                             "the CSV + summary.")
 
     args = parser.parse_args()
     args.core_root = validate_core_root(args.core_root)
@@ -272,13 +321,15 @@ def main(args: argparse.Namespace) -> int:
 
         with SuperPmi(args.mch, args.core_root) as spmi:
             if test_ids:
-                test_df = _rollout_all(spmi, jitrl, test_ids, f"{model_name} test")
+                test_df = _rollout_all(spmi, jitrl, test_ids, f"{model_name} test",
+                                        include_rl2020=args.include_rl2020)
                 test_csv = os.path.join(model_dir, f"{model_name}_test.csv")
                 test_df.to_csv(test_csv, index=False)
                 _summarize(test_df, f"TEST  ({model_name})")
 
             if train_ids:
-                train_df = _rollout_all(spmi, jitrl, train_ids, f"{model_name} train")
+                train_df = _rollout_all(spmi, jitrl, train_ids, f"{model_name} train",
+                                         include_rl2020=args.include_rl2020)
                 train_csv = os.path.join(model_dir, f"{model_name}_train.csv")
                 train_df.to_csv(train_csv, index=False)
                 _summarize(train_df, f"TRAIN ({model_name})")
