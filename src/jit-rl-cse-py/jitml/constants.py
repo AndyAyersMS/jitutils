@@ -13,6 +13,33 @@ INVALID_ACTION_LIMIT = 20
 
 CSE_SUCCESS_THRESHOLD = -5.0
 
+# Compile-mode tags where the JIT's weighted-count features
+# (``csdUseWtCnt`` / ``csdDefWtCnt``) reflect execution frequencies
+# actually observed at runtime rather than statically estimated ones.
+# Under PGO-driven tiered compilation, "Tier1" methods have been
+# JIT'd AFTER PGO data was collected during a lower-tier run; the
+# CSE profitability signals we train against are therefore
+# calibrated to real behaviour. "Tier1-OSR" is the same but for
+# on-stack replacement transitions.
+#
+# See chat 2026-07-07: without PGO the weights are static loop-nest
+# estimates that can be off by 10-100x for hot methods with cold
+# error paths, which corrupts the training reward. Filtering the
+# training pool to Tier1[+OSR] methods gives the RL a much
+# more trustworthy signal to optimise against.
+PGO_CALIBRATED_COMPILE_MODES = frozenset({"Tier1", "Tier1-OSR"})
+
+
+def is_pgo_calibrated_tier1(method) -> bool:
+    """Returns True if ``method.compile_mode`` is a Tier1 variant with
+    calibrated PGO-informed weights (either regular Tier1 or Tier1-OSR).
+
+    Silently returns False if the compile_mode field is empty (pre-Tier-1
+    parser output).
+    """
+    return method.compile_mode in PGO_CALIBRATED_COMPILE_MODES
+
+
 def is_acceptable_for_cse(method):
     """Returns True if the method is acceptable for training on JitCseEnv."""
     applicable = len([x for x in method.cse_candidates if x.viable])

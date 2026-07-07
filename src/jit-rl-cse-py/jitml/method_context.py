@@ -139,6 +139,15 @@ class MethodContext(BaseModel):
     heuristic : str = ""
     cses_chosen : List[int] = []
     cse_candidates : List[CseCandidate] = []
+    # Compile mode string from the trailing ``... (Tier1)`` marker on
+    # the JIT dump line. Values seen in the wild: "Tier0", "Tier1",
+    # "Tier1-OSR", "Instrumented Tier0", "Instrumented Tier1",
+    # "FullOpts", "MinOpts", "Tier0-FullOpts". Empty string if the
+    # marker was absent. Used by
+    # :func:`jitml.constants.is_pgo_calibrated_tier1` to filter for
+    # methods where the JIT's weights reflect real (PGO-collected)
+    # execution frequencies.
+    compile_mode : str = ""
     # Method-level features surfaced by CSE_HeuristicRLHook via a new
     # ``method,<v1>,<v2>,...`` line. All default to 0 so older cached
     # JSON produced by pre-Tier-1 JIT builds still loads. See
@@ -150,11 +159,22 @@ class MethodContext(BaseModel):
     # * ``large_frame`` / ``huge_frame``: frame-size class flags.
     # * ``code_opt_kind``: 0/1/2 = BLENDED/SMALL/FAST from the JIT's
     #   Compiler::codeOptimize enum.
+    # * ``add_cse_count``: number of CSEs already applied when the
+    #   features were emitted (equals the length of the
+    #   ``JitRLHookCSEDecisions`` list at DumpMetrics time). Gives the
+    #   ML side a raw sequence-index it can use directly or transform.
+    # * ``spill_at_weight_x1000``: sequence-aware register-pressure /
+    #   spill signal, mirroring ``CSE_HeuristicParameterized::GetStoppingFeatures``.
+    #   Log-scaled x1000 fixed-point (``log(max(1e-3, spillWeight)/1e-3) * 1000``).
+    #   Shrinks as CSEs are applied (m_addCSEcount reduces the effective
+    #   register budget).
     aggressive_ref_cnt_x1000 : int  = 0
     moderate_ref_cnt_x1000   : int  = 0
     large_frame              : bool = False
     huge_frame               : bool = False
     code_opt_kind            : int  = 0
+    add_cse_count            : int  = 0
+    spill_at_weight_x1000    : int  = 0
 
     def __str__(self):
         return f"{self.index}: {self.name}"

@@ -62,7 +62,8 @@ PER_CANDIDATE_SCHEMA = [
 ]
 
 # Method-level columns. bb_count and the per-class enreg counts are the
-# original 5; the trailing five are the Tier-1 additions.
+# original 5; the trailing five are Tier-1 additions; the last two are
+# the sequence-aware additions (add_cse_count, spill_at_weight_x1000).
 METHOD_SCHEMA = [
     ("bb_count",                  FEATURE_KIND_COUNT),
     ("enreg_count_int",           FEATURE_KIND_COUNT),
@@ -74,6 +75,11 @@ METHOD_SCHEMA = [
     ("large_frame",               FEATURE_KIND_BOOL),
     ("huge_frame",                FEATURE_KIND_BOOL),
     ("code_opt_kind",             FEATURE_KIND_ENUM_SMALL),
+    # Sequence-aware additions. add_cse_count is a raw sequence index
+    # (0..MAX_CSE); log1p compresses it fine. spill_at_weight_x1000 is
+    # already log-scaled x1000 fixed-point.
+    ("add_cse_count",             FEATURE_KIND_COUNT),
+    ("spill_at_weight_x1000",     FEATURE_KIND_LOG_X1000),
 ]
 
 FEATURES_PER_CANDIDATE = len(PER_CANDIDATE_SCHEMA)   # 30
@@ -368,6 +374,8 @@ class JitCseEnv(gym.Env):
             float(method.large_frame),
             float(method.huge_frame),
             method.code_opt_kind,
+            method.add_cse_count,
+            method.spill_at_weight_x1000,
         ], dtype=np.float32)
 
         return {"candidates": candidates, "method": method_arr}

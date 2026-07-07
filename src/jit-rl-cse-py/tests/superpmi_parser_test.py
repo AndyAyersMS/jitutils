@@ -288,3 +288,67 @@ def test_tier1_line_still_parses_without_method_line():
     # Per-candidate features still decode.
     assert len(ctx.cse_candidates) == 2
     assert ctx.cse_candidates[0].log_use_wt_x1000 == 12899
+
+
+def test_compile_mode_tag_extracted_when_present():
+    """The trailing ``... (Tier1)`` marker on the SPMI line becomes
+    ``MethodContext.compile_mode``. Empty when the marker is missing.
+    """
+    # STANDARD_LINE ends in ``(Tier1)`` -- should decode.
+    parser = _new_parser()
+    ctx = parser._parse_method_context(STANDARD_LINE)
+    assert ctx.compile_mode == "Tier1"
+
+    # A line with the newer FullOpts tag.
+    parser = _new_parser()
+    fullopts_line = STANDARD_LINE.replace("(Tier1)", "(FullOpts)")
+    ctx = parser._parse_method_context(fullopts_line)
+    assert ctx.compile_mode == "FullOpts"
+
+    # Multi-word compile-mode tag ("Instrumented Tier1") -- must not be
+    # truncated at whitespace inside the parens.
+    parser = _new_parser()
+    instr_line = STANDARD_LINE.replace("(Tier1)", "(Instrumented Tier1)")
+    ctx = parser._parse_method_context(instr_line)
+    assert ctx.compile_mode == "Instrumented Tier1"
+
+    # Tier1-OSR (hyphenated tag).
+    parser = _new_parser()
+    osr_line = STANDARD_LINE.replace("(Tier1)", "(Tier1-OSR)")
+    ctx = parser._parse_method_context(osr_line)
+    assert ctx.compile_mode == "Tier1-OSR"
+
+    # Line without a compile-mode marker: field defaults to empty.
+    parser = _new_parser()
+    no_tag_line = STANDARD_LINE.replace(" (Tier1)", "")
+    ctx = parser._parse_method_context(no_tag_line)
+    assert ctx.compile_mode == ""
+
+
+def test_tier1_pgo_filter_helper():
+    """``is_pgo_calibrated_tier1`` accepts regular Tier1 and Tier1-OSR
+    only; everything else (Tier0, Instrumented Tier1, FullOpts,
+    MinOpts, empty) is rejected. The user's chat 2026-07-07 explicitly
+    excludes ``Instrumented Tier1`` because those methods are
+    COLLECTING PGO data, not USING it, so their weights are still
+    static estimates.
+    """
+    from jitml.constants import is_pgo_calibrated_tier1
+
+    # Minimal MethodContext factory just for this filter test.
+    def make(compile_mode: str):
+        from jitml.method_context import MethodContext
+        return MethodContext(
+            index=1, name="X", hash="a", total_bytes=0, prolog_size=0,
+            instruction_count=0, perf_score=1.0, bytes_allocated=0,
+            num_cse=0, num_cse_candidate=0, compile_mode=compile_mode,
+        )
+
+    assert is_pgo_calibrated_tier1(make("Tier1")) is True
+    assert is_pgo_calibrated_tier1(make("Tier1-OSR")) is True
+
+    # Explicitly excluded compile modes.
+    for excluded in ("Tier0", "Instrumented Tier0", "Instrumented Tier1",
+                     "FullOpts", "MinOpts", "Tier0-FullOpts", ""):
+        assert is_pgo_calibrated_tier1(make(excluded)) is False, \
+            f"{excluded!r} must NOT pass the Tier1-PGO filter"

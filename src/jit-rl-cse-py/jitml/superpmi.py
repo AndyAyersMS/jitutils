@@ -200,6 +200,12 @@ class SuperPmi:
     # ' features #...' / ' seq ...' / ' spmi index ...' tokens don't get
     # slurped into the value list.
     _RE_METHOD_FEATURES   = re.compile(r' method,([0-9,\-]+)(?=(?: features #| seq | spmi index ))')
+    # The compile-mode tag at the very end of the line, in parens after
+    # the fully-qualified method name. Common values:
+    #   Tier0 / Tier0-FullOpts / Instrumented Tier0
+    #   Tier1 / Tier1-OSR / Instrumented Tier1
+    #   FullOpts / MinOpts
+    _RE_COMPILE_MODE      = re.compile(r'for method [^ ]+ \(([^)]+)\)\s*$')
 
     # Tail markers, in order they may appear after the heuristic name.
     _POST_NUM_CAND_TAIL_MARKERS = (
@@ -241,6 +247,15 @@ class SuperPmi:
         properties['num_cse']           = int(self._RE_NUM_CSE.search(line).group(1))
         properties['num_cse_candidate'] = int(self._RE_NUM_CAND.search(line).group(1))
         properties['heuristic']         = self._extract_heuristic_name(line)
+
+        # Compile-mode tag from the trailing ``... (Tier1)`` marker. Used
+        # to filter for methods that actually run CSE (Tier1, Tier1-OSR,
+        # Instrumented Tier1, FullOpts) and to drop the ones that don't
+        # (Tier0, MinOpts). Optional -- defaults to empty string if
+        # missing (very old JIT dumps or missing marker).
+        cm_match = self._RE_COMPILE_MODE.search(line)
+        if cm_match is not None:
+            properties['compile_mode'] = cm_match.group(1)
 
         # Method-level feature values (optional -- only present when the
         # JIT is invoked with a JitRLHook that supports the ``method``
