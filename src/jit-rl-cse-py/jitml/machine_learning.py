@@ -239,7 +239,7 @@ class LogCallback(BaseCallback):
             if no_cse != 0:
                 self._result_vs_no_cse.append((no_cse - final) / no_cse)
 
-            self._better_or_worse.append(1 if final < heuristic else -1 if final < heuristic else 0)
+            self._better_or_worse.append(1 if final < heuristic else -1 if final > heuristic else 0)
             self._choice_count.append(len(info['current'].cses_chosen))
             self._rewards.append(info['total_reward'])
 
