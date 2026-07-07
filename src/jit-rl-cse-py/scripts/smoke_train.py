@@ -63,6 +63,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--delta-reward", action="store_true",
                         help="Wrap the env with DeltaVsHeuristicRewardWrapper "
                              "(episode-end shaping term = (heuristic - final) / heuristic).")
+    parser.add_argument("--optimal-reward", action="store_true",
+                        help="Wrap the env with OptimalCseWrapper (per-step reward against best-of-"
+                             "alternatives; densifies the reward signal but adds ~4-5x per-step JIT cost).")
     parser.add_argument("--attention", action="store_true",
                         help="Use the AttentionOverCandidatesExtractor custom SB3 policy "
                              "(requires PPO or A2C).")
@@ -203,7 +206,7 @@ def main() -> int:
 
     print("[4/5] constructing JitCseEnv + PPO...")
     from jitml import JitCseEnv, JitCseModel  # lazy-imports torch/SB3
-    from jitml import NormalizeFeaturesWrapper, DeltaVsHeuristicRewardWrapper
+    from jitml import NormalizeFeaturesWrapper, DeltaVsHeuristicRewardWrapper, OptimalCseWrapper
     ctx = SuperPmiContext(core_root=args.core_root, mch=args.mch)
     # Load the split we just wrote; use the train side.
     _, train_ids = SuperPmiCache.get_test_train_methods(args.mch, args.core_root)
@@ -219,6 +222,9 @@ def main() -> int:
     if args.delta_reward:
         wrappers.append(DeltaVsHeuristicRewardWrapper)
         print("      + DeltaVsHeuristicRewardWrapper")
+    if args.optimal_reward:
+        wrappers.append(OptimalCseWrapper)
+        print("      + OptimalCseWrapper (dense per-step reward; ~4-5x per-step JIT cost)")
 
     model = JitCseModel(args.algorithm, use_attention=args.attention)
     if args.attention:
