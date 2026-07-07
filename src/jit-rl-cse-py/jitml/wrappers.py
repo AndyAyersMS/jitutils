@@ -77,51 +77,94 @@ class OptimalCseWrapper(gym.Wrapper):
 
 
 class NormalizeFeaturesWrapper(gym.ObservationWrapper):
-    """Apply ``log1p`` to count-like features in the observation.
+    """Normalize each observation column by its declared feature category.
 
-    Rationale: the raw features emitted by ``CSE_HeuristicRLHook`` mix
-    boolean / one-hot signals (already in a small range) with count-like
-    features (``use_wt_cnt_x100`` can reach 5-figure values,
-    ``cost_ex`` can reach the hundreds, etc.) that span multiple orders
-    of magnitude. Feeding them directly to a neural policy hurts
-    training because gradients explode. Applying ``log1p`` compresses
-    each count into a small range without dataset-specific statistics.
+    Reads the ``PER_CANDIDATE_SCHEMA`` and ``METHOD_SCHEMA`` from
+    :mod:`jitml.jit_cse` to decide the per-column transform:
+
+    * ``FEATURE_KIND_BOOL`` / ``FEATURE_KIND_ONEHOT``: identity
+      (already in ``{0, 1}``).
+    * ``FEATURE_KIND_COUNT``: ``log1p`` (compresses multi-order-of-
+      magnitude counts like ``use_wt_cnt_x100`` into a small range).
+    * ``FEATURE_KIND_LOG_X1000``: divide by 1000 (the JIT emits
+      ``deMinimusAdj + log(max(1e-3, wt))`` scaled by 1000; dividing
+      recovers the raw log value, typically 0..14).
+    * ``FEATURE_KIND_RATIO_X1000``: divide by 1000 (the JIT emits a
+      normalized ratio scaled by 1000; recovers [0, 1]).
+    * ``FEATURE_KIND_ENUM_SMALL``: divide by 2 (small integer bucket
+      in ``{0, 1, 2}``).
 
     Supports both the Dict observation space (candidates + method
     channels) currently produced by :class:`JitCseEnv` and the older
     flat Box observation space, in case a wrapper stack undoes the
-    Dict grouping.
+    Dict grouping. The flat path preserves the legacy positional
+    "everything after ``containable`` is a count" rule so pre-Tier-1
+    smoke scripts keep working.
     """
 
     def __init__(self, env: JitCseEnv):
         super().__init__(env)
 
-        unwrapped = env.unwrapped
+        # Lazy import to avoid a jit_cse<->wrappers circular import at
+        # module import time.
+        from .jit_cse import (
+            PER_CANDIDATE_SCHEMA, METHOD_SCHEMA,
+            FEATURE_KIND_BOOL, FEATURE_KIND_ONEHOT,
+            FEATURE_KIND_COUNT, FEATURE_KIND_LOG_X1000,
+            FEATURE_KIND_RATIO_X1000, FEATURE_KIND_ENUM_SMALL,
+            _CODE_OPT_KIND_DIVISOR,
+        )
+
         space = env.observation_space
 
+        def _masks(schema):
+            """Return (log1p_mask, scale_divisor) where log1p_mask is a
+            bool ndarray for columns that get ``log1p``, and scale_divisor
+            is a float ndarray giving the constant divisor for all
+            columns (1.0 for identity/log1p columns; positive value for
+            LOG_X1000/RATIO_X1000/ENUM_SMALL). The two are combined at
+            observation time as ``log1p(max(0, x))`` where log1p_mask
+            is set, else ``x / scale_divisor``."""
+            n = len(schema)
+            log1p_mask = np.zeros(n, dtype=bool)
+            scale_divisor = np.ones(n, dtype=np.float32)
+            for i, (_name, kind) in enumerate(schema):
+                if kind == FEATURE_KIND_COUNT:
+                    log1p_mask[i] = True
+                elif kind == FEATURE_KIND_LOG_X1000:
+                    scale_divisor[i] = 1000.0
+                elif kind == FEATURE_KIND_RATIO_X1000:
+                    scale_divisor[i] = 1000.0
+                elif kind == FEATURE_KIND_ENUM_SMALL:
+                    scale_divisor[i] = _CODE_OPT_KIND_DIVISOR
+                elif kind in (FEATURE_KIND_BOOL, FEATURE_KIND_ONEHOT):
+                    pass  # identity
+                else:
+                    raise ValueError(f"Unknown feature kind {kind!r} at slot {i}")
+            return log1p_mask, scale_divisor
+
         if isinstance(space, gym.spaces.Dict):
-            # Build a per-channel log1p mask.
-            per_cand_cols = list(unwrapped.per_candidate_columns)
-            cand_mask = np.zeros(len(per_cand_cols), dtype=bool)
-            cand_mask[per_cand_cols.index("containable") + 1:] = True
             self._is_dict = True
-            self._cand_mask = cand_mask
-            # All method-level features are counts.
-            self._method_mask = np.ones(len(unwrapped.method_columns), dtype=bool)
+            self._cand_log1p, self._cand_scale = _masks(PER_CANDIDATE_SCHEMA)
+            self._method_log1p, self._method_scale = _masks(METHOD_SCHEMA)
 
             cand_space = space.spaces["candidates"]
             method_space = space.spaces["method"]
             dtype = cand_space.dtype
             high_c = cand_space.high.copy()
-            high_c[:, cand_mask] = np.array(20.0, dtype=dtype)  # log1p(~5e8) ~ 20
+            high_c[:, self._cand_log1p] = np.array(20.0, dtype=dtype)  # log1p(~5e8) ~ 20
             high_m = method_space.high.copy()
-            high_m[self._method_mask] = np.array(20.0, dtype=dtype)
+            high_m[self._method_log1p] = np.array(20.0, dtype=dtype)
             self.observation_space = gym.spaces.Dict({
                 "candidates": gym.spaces.Box(low=cand_space.low, high=high_c, dtype=dtype),
                 "method":     gym.spaces.Box(low=method_space.low, high=high_m, dtype=dtype),
             })
         else:
-            # Legacy flat-observation path.
+            # Legacy flat-observation path. Preserve the pre-Tier-1
+            # "everything after ``containable`` is a count" rule -- this
+            # branch is only reached by legacy smoke scripts that stack
+            # wrappers such that the Dict grouping was flattened.
+            unwrapped = env.unwrapped
             columns = list(unwrapped.observation_columns)
             count_start = columns.index("containable") + 1
             mask = np.zeros(len(columns), dtype=bool)
@@ -141,8 +184,16 @@ class NormalizeFeaturesWrapper(gym.ObservationWrapper):
             dtype = self.observation_space.spaces["candidates"].dtype
             cand = np.asarray(observation["candidates"], dtype=dtype).copy()
             method = np.asarray(observation["method"], dtype=dtype).copy()
-            cand[:, self._cand_mask] = np.log1p(np.maximum(cand[:, self._cand_mask], 0.0))
-            method[self._method_mask] = np.log1p(np.maximum(method[self._method_mask], 0.0))
+
+            # Divide by per-column scale (1.0 for identity, 1000.0 for
+            # log_x1000/ratio_x1000, 2.0 for enum_small). Applied to
+            # every column; count columns then get log1p on top of the
+            # (no-op) divide-by-1.0.
+            cand /= self._cand_scale
+            method /= self._method_scale
+
+            cand[:, self._cand_log1p] = np.log1p(np.maximum(cand[:, self._cand_log1p], 0.0))
+            method[self._method_log1p] = np.log1p(np.maximum(method[self._method_log1p], 0.0))
             return {"candidates": cand, "method": method}
 
         out = np.asarray(observation, dtype=self.observation_space.dtype).copy()

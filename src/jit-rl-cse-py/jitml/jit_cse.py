@@ -8,20 +8,84 @@ from .method_context import JitType, MethodContext
 from .superpmi import MethodKind, SuperPmi, SuperPmiCache, SuperPmiContext
 from .constants import (INVALID_ACTION_PENALTY, INVALID_ACTION_LIMIT, MAX_CSE, is_acceptable_for_cse)
 
-# observation space
-JITTYPE_ONEHOT_SIZE = 6
-BOOLEAN_FEATURES = 7
-# 8 core scalar features per candidate + block_spread (per-candidate).
-# The method-level features (bb_count + 4 per-class enreg counts) live
-# in a separate "method" channel of the Dict observation space, since
-# they are identical across every candidate in the same method and
-# duplicating them wastes model capacity.
-FLOAT_FEATURES_PER_CANDIDATE = 9
-FEATURES_PER_CANDIDATE = JITTYPE_ONEHOT_SIZE + BOOLEAN_FEATURES + FLOAT_FEATURES_PER_CANDIDATE
-METHOD_LEVEL_FEATURES = 5
-# Legacy alias kept so callers reading ``FEATURES`` keep working, but
-# it no longer describes the full observation once the Dict space is used.
+# Per-column feature category tags used by ``NormalizeFeaturesWrapper``
+# to decide how to preprocess each observation slot.
+#
+#   BOOL             -- already in {0, 1}, no transform.
+#   ONEHOT           -- already in {0, 1}, no transform (type one-hot).
+#   COUNT            -- raw non-negative count, apply ``log1p``.
+#   LOG_X1000        -- already log-scaled x1000 fixed-point (JIT emits
+#                       ``deMinimusAdj + log(max(1e-3, wt))`` * 1000).
+#                       Divide by 1000 to recover the log value, no log1p.
+#   RATIO_X1000      -- already a 0..1000 fixed-point ratio. Divide by
+#                       1000 to recover [0, 1], no log1p.
+#   ENUM_SMALL       -- small integer bucket in {0, 1, 2}. Divide by 2.
+FEATURE_KIND_BOOL         = "bool"
+FEATURE_KIND_ONEHOT       = "onehot"
+FEATURE_KIND_COUNT        = "count"
+FEATURE_KIND_LOG_X1000    = "log_x1000"
+FEATURE_KIND_RATIO_X1000  = "ratio_x1000"
+FEATURE_KIND_ENUM_SMALL   = "enum_small"
+
+# Per-candidate columns: (name, kind). Ordering here defines the row
+# ordering of the ``candidates`` channel of the Dict observation.
+PER_CANDIDATE_SCHEMA = [
+    # One-hot type expansion (JitType 1..6 -> 6 slots).
+    *[(f"type_{JitType(i).name.lower()}", FEATURE_KIND_ONEHOT) for i in range(1, 7)],
+    # Boolean features.
+    ("can_apply",                FEATURE_KIND_BOOL),
+    ("live_across_call",         FEATURE_KIND_BOOL),
+    ("const",                    FEATURE_KIND_BOOL),
+    ("shared_const",             FEATURE_KIND_BOOL),
+    ("make_cse",                 FEATURE_KIND_BOOL),
+    ("has_call",                 FEATURE_KIND_BOOL),
+    ("containable",              FEATURE_KIND_BOOL),
+    ("const_and_live",           FEATURE_KIND_BOOL),
+    ("const_and_min_cost",       FEATURE_KIND_BOOL),
+    ("min_cost_and_live",        FEATURE_KIND_BOOL),
+    ("containable_and_low_cost", FEATURE_KIND_BOOL),
+    ("live_across_call_lsra",    FEATURE_KIND_BOOL),
+    # Already-normalized already-log-scaled or ratio features.
+    ("log_use_wt_x1000",         FEATURE_KIND_LOG_X1000),
+    ("log_def_wt_x1000",         FEATURE_KIND_LOG_X1000),
+    ("block_spread_x1000_per_bb", FEATURE_KIND_RATIO_X1000),
+    # Raw counts (get log1p'd).
+    ("cost_ex",                  FEATURE_KIND_COUNT),
+    ("cost_sz",                  FEATURE_KIND_COUNT),
+    ("use_count",                FEATURE_KIND_COUNT),
+    ("def_count",                FEATURE_KIND_COUNT),
+    ("use_wt_cnt_x100",          FEATURE_KIND_COUNT),
+    ("def_wt_cnt_x100",          FEATURE_KIND_COUNT),
+    ("distinct_locals",          FEATURE_KIND_COUNT),
+    ("local_occurrences",        FEATURE_KIND_COUNT),
+    ("block_spread",             FEATURE_KIND_COUNT),
+]
+
+# Method-level columns. bb_count and the per-class enreg counts are the
+# original 5; the trailing five are the Tier-1 additions.
+METHOD_SCHEMA = [
+    ("bb_count",                  FEATURE_KIND_COUNT),
+    ("enreg_count_int",           FEATURE_KIND_COUNT),
+    ("enreg_count_float",         FEATURE_KIND_COUNT),
+    ("enreg_count_simd",          FEATURE_KIND_COUNT),
+    ("enreg_count_msk",           FEATURE_KIND_COUNT),
+    ("aggressive_ref_cnt_x1000",  FEATURE_KIND_COUNT),
+    ("moderate_ref_cnt_x1000",    FEATURE_KIND_COUNT),
+    ("large_frame",               FEATURE_KIND_BOOL),
+    ("huge_frame",                FEATURE_KIND_BOOL),
+    ("code_opt_kind",             FEATURE_KIND_ENUM_SMALL),
+]
+
+FEATURES_PER_CANDIDATE = len(PER_CANDIDATE_SCHEMA)   # 30
+METHOD_LEVEL_FEATURES  = len(METHOD_SCHEMA)          # 10
+
+# Legacy compat: some callers (notebooks, older scripts) still read
+# ``FEATURES``. Keep it pointing at the per-candidate width.
 FEATURES = FEATURES_PER_CANDIDATE
+
+# Small-enum divisor (BLENDED=0, SMALL=1, FAST=2 -> divide by 2 to get
+# [0, 1] range).
+_CODE_OPT_KIND_DIVISOR = 2.0
 
 # Scale up the reward to make it more meaningful.
 REWARD_SCALE = 5.0
@@ -32,32 +96,29 @@ class JitCseEnv(gym.Env):
     Uses a Dict observation space with two channels:
 
     * ``candidates``: shape ``(MAX_CSE, FEATURES_PER_CANDIDATE)``. One
-      row per (padded) candidate: one-hot type, booleans, per-candidate
-      scalar counts, ``block_spread``.
+      row per (padded) candidate: one-hot type, booleans (base + Tier-1
+      joint bools + LSRA-live), pre-normalized log-scale weights and
+      ratio, and raw per-candidate counts.
     * ``method``: shape ``(METHOD_LEVEL_FEATURES,)``. Features that are
-      constant across every candidate in the method:
-      ``bb_count`` + per-register-class enreg counts.
+      constant across every candidate in the method: ``bb_count`` +
+      per-register-class enreg counts + Tier-1 additions
+      (``aggressive_ref_cnt_x1000``, ``moderate_ref_cnt_x1000``,
+      ``large_frame``, ``huge_frame``, ``code_opt_kind``).
 
     Callers train against this env with an SB3 ``MultiInputPolicy``
     rather than ``MlpPolicy``; ``JitCseModel._create`` picks the right
     policy automatically based on the env's observation space.
+
+    See :data:`PER_CANDIDATE_SCHEMA` and :data:`METHOD_SCHEMA` for the
+    (name, kind) tuple that drives both the observation ordering and
+    the ``NormalizeFeaturesWrapper`` normalization strategy.
     """
 
-    per_candidate_columns : List[str] = [f"type_{JitType(i).name.lower()}" for i in range(1, 7)] + [
-        "can_apply", "live_across_call", "const", "shared_const",
-        "make_cse", "has_call", "containable",
-        "cost_ex", "cost_sz", "use_count", "def_count",
-        "use_wt_cnt_x100", "def_wt_cnt_x100",
-        "distinct_locals", "local_occurrences",
-        "block_spread",
-    ]
-    method_columns : List[str] = [
-        "bb_count",
-        "enreg_count_int", "enreg_count_float", "enreg_count_simd", "enreg_count_msk",
-    ]
+    per_candidate_columns : List[str] = [name for name, _ in PER_CANDIDATE_SCHEMA]
+    method_columns        : List[str] = [name for name, _ in METHOD_SCHEMA]
     # Kept for anyone who still inspects a "flat" column list (e.g. legacy
     # notebooks). Equal to per_candidate_columns + method_columns.
-    observation_columns : List[str] = per_candidate_columns + method_columns
+    observation_columns   : List[str] = per_candidate_columns + method_columns
 
     def __init__(self, context : SuperPmiContext, methods : Optional[List[int]] = None, **kwargs):
         super().__init__(**kwargs)
@@ -220,11 +281,17 @@ class JitCseEnv(gym.Env):
         """Builds the Dict observation for a method without normalizing.
 
         Returns a ``{'candidates': (MAX_CSE, FEATURES_PER_CANDIDATE),
-        'method': (METHOD_LEVEL_FEATURES,)}`` numpy dict. The method-level
-        channel holds features that are constant across every candidate
-        of the method (``bb_count`` + per-register-class enreg counts);
-        they are read from the first candidate since the JIT emits them
-        per-candidate but with the same value each time.
+        'method': (METHOD_LEVEL_FEATURES,)}`` numpy dict. Values are the
+        raw JIT-emitted ints (as floats); ``NormalizeFeaturesWrapper``
+        is responsible for applying the appropriate transform per
+        column category (log1p for counts, /1000 for log-x1000 or
+        ratio-x1000, /2 for the small code-opt-kind enum, identity for
+        booleans and one-hot).
+
+        The method-level channel holds features that are constant
+        across every candidate of the method; they are read from the
+        candidate list (bb_count, enreg counts) or the parent
+        MethodContext (Tier-1 additions).
         """
         candidate_rows: List[List[float]] = []
         for cse in method.cse_candidates:
@@ -236,17 +303,27 @@ class JitCseEnv(gym.Env):
                 one_hot[cse.type - 1] = 1.0
             row.extend(one_hot)
 
-            # boolean features
+            # boolean features (base 7 + Tier-1 joints + LSRA-live)
             row.extend([
                 float(cse.can_apply), float(cse.live_across_call), float(cse.const),
                 float(cse.shared_const), float(cse.make_cse), float(cse.has_call),
                 float(cse.containable),
+                float(cse.const_and_live), float(cse.const_and_min_cost),
+                float(cse.min_cost_and_live), float(cse.containable_and_low_cost),
+                float(cse.live_across_call_lsra),
             ])
 
-            # per-candidate scalar features. The two weighted counts are
+            # Already-normalized log-scale weights + ratio.
+            row.extend([
+                float(cse.log_use_wt_x1000),
+                float(cse.log_def_wt_x1000),
+                float(cse.block_spread_x1000_per_bb),
+            ])
+
+            # per-candidate scalar counts. The two weighted counts are
             # the JIT-emitted x100 fixed-point values; the observation
-            # preserves that scale rather than dividing by 100 so a
-            # wrapper can log1p it uniformly with the other counts.
+            # preserves that scale rather than dividing by 100 so the
+            # wrapper can log1p them uniformly with the other counts.
             row.extend([
                 float(cse.cost_ex), float(cse.cost_sz),
                 float(cse.use_count), float(cse.def_count),
@@ -265,20 +342,33 @@ class JitCseEnv(gym.Env):
         candidates = (np.vstack(candidate_rows) if candidate_rows
                       else np.zeros((MAX_CSE, FEATURES_PER_CANDIDATE))).astype(np.float32)
 
-        # Method-level features: bb_count + per-class enreg counts. These
-        # are the same for every candidate; read the first one that has
-        # a value. Fall back to zeros if the method has no candidates.
+        # Method-level features: bb_count + per-class enreg counts +
+        # Tier-1 additions. bb_count / enreg counts are per-candidate in
+        # the JIT dump but identical across candidates; read from the
+        # first candidate. The Tier-1 additions
+        # (aggressive_ref_cnt / moderate_ref_cnt / *_frame /
+        # code_opt_kind) live on MethodContext itself.
         if method.cse_candidates:
             first = method.cse_candidates[0]
-            method_arr = np.array([
-                first.bb_count,
+            bb_count = first.bb_count
+            e_int, e_flt, e_simd, e_msk = (
                 first.enreg_count_int,
                 first.enreg_count_float,
                 first.enreg_count_simd,
                 first.enreg_count_msk,
-            ], dtype=np.float32)
+            )
         else:
-            method_arr = np.zeros(METHOD_LEVEL_FEATURES, dtype=np.float32)
+            bb_count = 0
+            e_int = e_flt = e_simd = e_msk = 0
+
+        method_arr = np.array([
+            bb_count, e_int, e_flt, e_simd, e_msk,
+            method.aggressive_ref_cnt_x1000,
+            method.moderate_ref_cnt_x1000,
+            float(method.large_frame),
+            float(method.huge_frame),
+            method.code_opt_kind,
+        ], dtype=np.float32)
 
         return {"candidates": candidates, "method": method_arr}
 
