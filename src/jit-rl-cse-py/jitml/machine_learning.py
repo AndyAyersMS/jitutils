@@ -23,6 +23,7 @@ from .jit_cse import JitCseEnv
 class JitCseModel:
     """The raw implementation of the machine learning agent."""
     def __init__(self, algorithm, device='auto', make_env=None, ent_coef=0.01,
+                 clip_range=0.2,
                  verbose=False, use_attention=False, attention_kwargs=None):
         if algorithm not in ('PPO', 'A2C', 'DQN'):
             raise ValueError(f"Unknown algorithm {algorithm}.  Must be one of: PPO, A2C, DQN")
@@ -30,6 +31,11 @@ class JitCseModel:
         self.algorithm = algorithm
         self.device = device
         self.ent_coef = ent_coef
+        # ``clip_range`` is the PPO trust-region clip parameter. SB3 default
+        # is 0.2. Lower values (e.g. 0.1) tighten the trust region, which
+        # smooths KL swings at the cost of slower learning. Ignored for
+        # non-PPO algorithms.
+        self.clip_range = clip_range
         self.verbose = verbose
         self.make_env = make_env
         # If True, plug in the attention-over-candidates features
@@ -145,6 +151,7 @@ class JitCseModel:
 
         if alg == PPO:
             return alg(policy, env, device=self.device, ent_coef=self.ent_coef,
+                       clip_range=self.clip_range,
                        verbose=self.verbose, **extra_kwargs, **kwargs)
 
         return alg(policy, env, device=self.device, verbose=self.verbose,

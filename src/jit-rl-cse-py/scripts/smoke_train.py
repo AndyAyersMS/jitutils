@@ -69,6 +69,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--attention", action="store_true",
                         help="Use the AttentionOverCandidatesExtractor custom SB3 policy "
                              "(requires PPO or A2C).")
+    parser.add_argument("--ent-coef", type=float, default=0.01,
+                        help="PPO entropy bonus coefficient (default 0.01). Higher values "
+                             "keep the policy exploratory; 0.02-0.05 is a common range when "
+                             "the policy is collapsing to a single action.")
+    parser.add_argument("--clip-range", type=float, default=0.2,
+                        help="PPO trust-region clip range (default 0.2). Lower (e.g. 0.1) "
+                             "tightens the trust region, smoothing KL swings.")
     return parser.parse_args()
 
 
@@ -226,9 +233,11 @@ def main() -> int:
         wrappers.append(OptimalCseWrapper)
         print("      + OptimalCseWrapper (dense per-step reward; ~4-5x per-step JIT cost)")
 
-    model = JitCseModel(args.algorithm, use_attention=args.attention)
+    model = JitCseModel(args.algorithm, use_attention=args.attention,
+                        ent_coef=args.ent_coef, clip_range=args.clip_range)
     if args.attention:
         print(f"      + AttentionOverCandidatesExtractor ({args.algorithm})")
+    print(f"      ent_coef={args.ent_coef:g}  clip_range={args.clip_range:g}")
 
     print(f"[5/5] running {args.algorithm} for {args.iterations} iterations...")
     t0 = time.time()
