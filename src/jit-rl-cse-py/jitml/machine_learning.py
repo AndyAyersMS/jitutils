@@ -23,10 +23,13 @@ from .jit_cse import JitCseEnv
 class JitCseModel:
     """The raw implementation of the machine learning agent."""
     def __init__(self, algorithm, device='auto', make_env=None, ent_coef=0.01,
-                 clip_range=0.2,
-                 verbose=False, use_attention=False, attention_kwargs=None):
+                 clip_range=0.2, net_arch=None,
+                 verbose=False, use_attention=False, attention_kwargs=None,
+                 use_linear_scorer=False):
         if algorithm not in ('PPO', 'A2C', 'DQN'):
             raise ValueError(f"Unknown algorithm {algorithm}.  Must be one of: PPO, A2C, DQN")
+        if use_attention and use_linear_scorer:
+            raise ValueError("use_attention and use_linear_scorer are mutually exclusive")
 
         self.algorithm = algorithm
         self.device = device
@@ -36,6 +39,14 @@ class JitCseModel:
         # smooths KL swings at the cost of slower learning. Ignored for
         # non-PPO algorithms.
         self.clip_range = clip_range
+        # ``net_arch`` controls the size of the policy/value MLP heads. It
+        # is passed through to SB3 via ``policy_kwargs["net_arch"]``. Use
+        # ``None`` to accept the SB3 default ([64, 64] for the standard
+        # MlpPolicy / MultiInputPolicy). Use ``[]`` for a linear policy
+        # (single dense layer from features to logits), or a small list
+        # like ``[32]`` for a shallow MLP -- useful for testing whether
+        # the neural net is overparameterized vs the training set size.
+        self.net_arch = net_arch
         self.verbose = verbose
         self.make_env = make_env
         # If True, plug in the attention-over-candidates features
@@ -44,6 +55,10 @@ class JitCseModel:
         # (DQN currently uses a different policy hierarchy).
         self.use_attention = use_attention
         self.attention_kwargs = attention_kwargs or {}
+        # If True, use the RL2020-style linear per-candidate scorer
+        # (see :mod:`jitml.linear_scorer_policy`). ~350 params total
+        # vs ~70k for attention; matches RL2020's inductive bias.
+        self.use_linear_scorer = use_linear_scorer
         self._model = None
 
     def load(self, path):
@@ -148,6 +163,25 @@ class JitCseModel:
                 )
             from .attention_policy import make_attention_policy_kwargs
             extra_kwargs["policy_kwargs"] = make_attention_policy_kwargs(**self.attention_kwargs)
+
+        if self.use_linear_scorer:
+            if alg is DQN:
+                raise ValueError("use_linear_scorer=True is only supported with PPO or A2C")
+            if policy != "MultiInputPolicy":
+                raise ValueError(
+                    "use_linear_scorer=True requires a Dict observation space "
+                    "(the default JitCseEnv provides one)."
+                )
+            from .linear_scorer_policy import make_linear_scorer_policy_kwargs
+            extra_kwargs["policy_kwargs"] = make_linear_scorer_policy_kwargs()
+
+        # ``net_arch`` overrides the SB3 default policy/value MLP head
+        # sizing. Passed through as ``policy_kwargs["net_arch"]``. If we
+        # already have a policy_kwargs (attention path), we merge; else
+        # create a fresh dict. ``[]`` is valid and means "linear".
+        if self.net_arch is not None:
+            pk = extra_kwargs.setdefault("policy_kwargs", {})
+            pk["net_arch"] = list(self.net_arch)
 
         if alg == PPO:
             return alg(policy, env, device=self.device, ent_coef=self.ent_coef,

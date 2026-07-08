@@ -69,6 +69,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--attention", action="store_true",
                         help="Use the AttentionOverCandidatesExtractor custom SB3 policy "
                              "(requires PPO or A2C).")
+    parser.add_argument("--linear-scorer", action="store_true",
+                        help="Use the RL2020-style LinearPerCandidateExtractor: shared linear "
+                             "scorer across candidates + separate scorer for the stop action. "
+                             "~350 params total (vs ~70k for --attention). Mutually exclusive "
+                             "with --attention.")
     parser.add_argument("--ent-coef", type=float, default=0.01,
                         help="PPO entropy bonus coefficient (default 0.01). Higher values "
                              "keep the policy exploratory; 0.02-0.05 is a common range when "
@@ -76,6 +81,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-range", type=float, default=0.2,
                         help="PPO trust-region clip range (default 0.2). Lower (e.g. 0.1) "
                              "tightens the trust region, smoothing KL swings.")
+    parser.add_argument("--net-arch", type=str, default=None,
+                        help="Override the SB3 policy/value MLP head sizes. Comma-separated "
+                             "ints, e.g. '32,32'. Empty string '' means a linear head "
+                             "(single dense layer, no hidden units). Default (unset) uses "
+                             "the SB3 built-in default (typically [64, 64]). Useful to test "
+                             "whether the neural net is overparameterized vs the training-"
+                             "set size.")
     return parser.parse_args()
 
 
@@ -233,10 +245,20 @@ def main() -> int:
         wrappers.append(OptimalCseWrapper)
         print("      + OptimalCseWrapper (dense per-step reward; ~4-5x per-step JIT cost)")
 
+    net_arch = None
+    if args.net_arch is not None:
+        net_arch = [int(x) for x in args.net_arch.split(",") if x.strip() != ""]
+
     model = JitCseModel(args.algorithm, use_attention=args.attention,
-                        ent_coef=args.ent_coef, clip_range=args.clip_range)
+                        use_linear_scorer=args.linear_scorer,
+                        ent_coef=args.ent_coef, clip_range=args.clip_range,
+                        net_arch=net_arch)
     if args.attention:
         print(f"      + AttentionOverCandidatesExtractor ({args.algorithm})")
+    if args.linear_scorer:
+        print(f"      + LinearPerCandidateExtractor ({args.algorithm})")
+    if net_arch is not None:
+        print(f"      net_arch={net_arch}")
     print(f"      ent_coef={args.ent_coef:g}  clip_range={args.clip_range:g}")
 
     print(f"[5/5] running {args.algorithm} for {args.iterations} iterations...")
