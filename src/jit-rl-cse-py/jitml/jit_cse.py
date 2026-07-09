@@ -48,6 +48,13 @@ PER_CANDIDATE_SCHEMA = [
     # Already-normalized already-log-scaled or ratio features.
     ("log_use_wt_x1000",         FEATURE_KIND_LOG_X1000),
     ("log_def_wt_x1000",         FEATURE_KIND_LOG_X1000),
+    # Multiplicative log-interaction features from the JIT's parameterized
+    # heuristic (features[18], [19]): log(useCount*useWtCnt) and
+    # log(numLocalOccurrences*useWtCnt). These are dynamic-pressure
+    # proxies that a neural net can't easily synthesize from raw
+    # use_count + log_use_wt.
+    ("log_use_cnt_x_wt_x1000",   FEATURE_KIND_LOG_X1000),
+    ("log_local_occ_x_wt_x1000", FEATURE_KIND_LOG_X1000),
     ("block_spread_x1000_per_bb", FEATURE_KIND_RATIO_X1000),
     # Raw counts (get log1p'd).
     ("cost_ex",                  FEATURE_KIND_COUNT),
@@ -319,10 +326,12 @@ class JitCseEnv(gym.Env):
                 float(cse.live_across_call_lsra),
             ])
 
-            # Already-normalized log-scale weights + ratio.
+            # Already-normalized log-scale weights + interaction features + ratio.
             row.extend([
                 float(cse.log_use_wt_x1000),
                 float(cse.log_def_wt_x1000),
+                float(cse.log_use_cnt_x_wt_x1000),
+                float(cse.log_local_occ_x_wt_x1000),
                 float(cse.block_spread_x1000_per_bb),
             ])
 

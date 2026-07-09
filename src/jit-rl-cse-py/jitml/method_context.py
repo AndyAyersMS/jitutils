@@ -81,6 +81,12 @@ class CseCandidate(BaseModel):
     #   carries.
     log_use_wt_x1000            : int  = 0
     log_def_wt_x1000            : int  = 0
+    # Multiplicative log-interaction features (mirror
+    # CSE_HeuristicParameterized features[18], [19] which the hand-tuned
+    # parameterized heuristic already uses). Recover as
+    # log_use_cnt_x_wt_x1000 / 1000.0 -> log(max(1e-3, useCount*useWtCnt)/1e-3).
+    log_use_cnt_x_wt_x1000      : int  = 0
+    log_local_occ_x_wt_x1000    : int  = 0
     const_and_live              : bool = False
     const_and_min_cost          : bool = False
     min_cost_and_live           : bool = False
