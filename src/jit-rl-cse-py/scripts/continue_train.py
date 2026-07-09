@@ -50,6 +50,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--normalize-features", action="store_true",
                    help="Wrap env with NormalizeFeaturesWrapper. MUST match the "
                         "original run.")
+    p.add_argument("--parallel", type=int, default=None,
+                   help="Number of parallel SubprocVecEnv workers (each spawns "
+                        "its own superpmi + JIT). Default: single-process. "
+                        "Mirrors RLCSE's SPMIServerPool; expect ~Nx wall-clock "
+                        "speedup on JIT-dominated training.")
     return p.parse_args()
 
 
@@ -73,11 +78,23 @@ def main() -> int:
     from jitml import JitCseEnv, NormalizeFeaturesWrapper  # lazy torch/SB3 import
     from jitml.machine_learning import LogCallback
     from stable_baselines3 import PPO
+    from stable_baselines3.common.env_util import make_vec_env
+    from stable_baselines3.common.vec_env import SubprocVecEnv
 
     ctx = SuperPmiContext(core_root=args.core_root, mch=args.mch)
-    env = JitCseEnv(ctx, train_ids)
+
+    def make_env():
+        env = JitCseEnv(ctx, train_ids)
+        if args.normalize_features:
+            env = NormalizeFeaturesWrapper(env)
+        return env
+
+    if args.parallel is not None and args.parallel > 1:
+        env = make_vec_env(make_env, n_envs=args.parallel, vec_env_cls=SubprocVecEnv)
+        print(f"      SubprocVecEnv with n_envs={args.parallel}")
+    else:
+        env = make_env()
     if args.normalize_features:
-        env = NormalizeFeaturesWrapper(env)
         print("      + NormalizeFeaturesWrapper")
 
     print(f"[3/4] loading model from {args.input_model}")
