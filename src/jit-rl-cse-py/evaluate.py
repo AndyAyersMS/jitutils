@@ -116,7 +116,13 @@ def _rollout(superpmi: SuperPmi, jitrl: JitCseModel, method_id: int,
     curr: MethodContext = no_cse
     while any(c.can_apply for c in curr.cse_candidates):
         try:
-            action = _greedy_action(jitrl, curr, can_terminate=bool(chosen))
+            # can_terminate=True unconditionally: the correct greedy answer
+            # for many methods is to do zero CSEs. The prior
+            # ``can_terminate=bool(chosen)`` mirrored an old JitCseEnv
+            # constraint that has since been removed (see
+            # jit_cse.py._is_valid_action) and was systematically biasing
+            # greedy eval toward over-CSEing narrow methods.
+            action = _greedy_action(jitrl, curr, can_terminate=True)
         except ValueError:
             break
         if action is None:

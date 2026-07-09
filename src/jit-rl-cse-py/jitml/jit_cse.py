@@ -282,9 +282,16 @@ class JitCseEnv(gym.Env):
         return REWARD_SCALE * (prev - curr) / prev
 
     def _is_valid_action(self, action, method):
-        # Terminating is only valid if we have performed a CSE.  Doing no CSEs isn't allowed.
+        # Stop ("None" action) is ALWAYS valid: the correct answer for a
+        # non-trivial fraction of methods is to do zero CSEs (e.g. narrow
+        # methods where any CSE hurts perf-score due to added spill/copy
+        # cost). The previous behavior (require at least one CSE before
+        # allowing terminate) systematically biased the policy toward
+        # over-CSEing narrow methods -- diagnosed post-Campaign C when
+        # 11/18 persistent worst-case eval methods were exactly this
+        # pattern (heuristic did nothing, RL over-CSE'd).
         if action is None:
-            return bool(method.cses_chosen)
+            return True
 
         candidate = method.cse_candidates[action] if action < len(method.cse_candidates) else None
         return candidate is not None and candidate.can_apply
