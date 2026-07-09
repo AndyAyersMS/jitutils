@@ -227,13 +227,15 @@ def test_curriculum_buckets():
                              perf_score=1.0, bytes_allocated=0, num_cse=0,
                              num_cse_candidate=num_cand, cse_candidates=cands)
 
-    # Skip candidate counts below MIN_CSE (=3) — those get filtered out.
-    methods = [make(i, i) for i in range(MIN_CSE, 17)]  # counts 3..16
+    # Include candidate counts across the range [MIN_CSE..MAX_CSE-1]. With
+    # MIN_CSE=1 and default thresholds (3, 6, 10, 16), tier 0 now captures
+    # counts 1..3 (previously just 3 when MIN_CSE was 3).
+    methods = [make(i, i) for i in range(MIN_CSE, 17)]  # counts MIN_CSE..16
     tiers = curriculum_buckets(methods)
     assert len(tiers) == 4
     # thresholds default is (3, 6, 10, 16): tier 0 = 1..3, tier 1 = 4..6,
     # tier 2 = 7..10, tier 3 = 11..16.
-    assert [m.num_cse_candidate for m in tiers[0]] == [3]
+    assert [m.num_cse_candidate for m in tiers[0]] == [1, 2, 3]
     assert [m.num_cse_candidate for m in tiers[1]] == [4, 5, 6]
     assert [m.num_cse_candidate for m in tiers[2]] == [7, 8, 9, 10]
     assert [m.num_cse_candidate for m in tiers[3]] == [11, 12, 13, 14, 15, 16]

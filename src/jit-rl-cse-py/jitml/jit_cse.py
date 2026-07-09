@@ -314,7 +314,7 @@ class JitCseEnv(gym.Env):
         MethodContext (Tier-1 additions).
         """
         candidate_rows: List[List[float]] = []
-        for cse in method.cse_candidates:
+        for cse in method.cse_candidates[:MAX_CSE]:
             row: List[float] = []
 
             # one-hot encode the type (JitType 1..6 -> six slots)

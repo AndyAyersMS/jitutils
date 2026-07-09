@@ -5,8 +5,8 @@ from typing import Sequence
 import numpy as np
 from .method_context import MethodContext
 
-MIN_CSE = 3
-MAX_CSE = 16
+MIN_CSE = 1
+MAX_CSE = 32
 
 INVALID_ACTION_PENALTY = -0.05
 INVALID_ACTION_LIMIT = 20

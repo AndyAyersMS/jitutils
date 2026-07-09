@@ -29,14 +29,14 @@ import json
 import os
 import sys
 import time
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 # Allow running from the repo tree without an install.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from jitml.method_context import MethodContext  # noqa: E402
 from jitml.superpmi import MethodKind, SuperPmi, SuperPmiCache, SuperPmiContext  # noqa: E402
-from jitml.constants import is_acceptable_for_cse, split_for_cse  # noqa: E402
+from jitml.constants import MAX_CSE, is_acceptable_for_cse, split_for_cse  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
@@ -88,25 +88,49 @@ def _parse_args() -> argparse.Namespace:
                              "the SB3 built-in default (typically [64, 64]). Useful to test "
                              "whether the neural net is overparameterized vs the training-"
                              "set size.")
+    parser.add_argument("--skip-indices", type=str, default=None,
+                        help="Path to a file containing a list of method indices (one per "
+                             "line) to skip during scanning. Useful when scanning a big "
+                             "MCH that contains held-out test indices (e.g. scanning "
+                             "combined.tier1.mch while excluding the 750 methods that live "
+                             "in test.mch).")
     return parser.parse_args()
 
 
 def _pick_methods(spmi: SuperPmi, scan_limit: int, want: int,
-                  stratified: bool = True) -> List[MethodContext]:
+                  stratified: bool = True,
+                  skip_indices: Optional[set] = None) -> List[MethodContext]:
     """Scan the MCH one method at a time; return up to ``want`` methods
     that pass ``is_acceptable_for_cse`` (i.e. have between MIN_CSE and
     MAX_CSE viable candidates).
 
-    If ``stratified`` is True (default), the picks are balanced across
-    candidate-count buckets [1-3], [4-6], [7-10], [11-16] so the training
-    distribution isn't dominated by whichever bucket happens to be dense
-    at the front of the MCH. This directly addresses the training bias
-    the Phase-0 diagnostic surfaced (policy learning positional shortcuts
-    from a homogeneous training set).
+    If ``stratified`` is True (default), the picks are balanced along
+    **two axes**:
+
+    1. **Candidate count**: 6 buckets covering the current MIN_CSE..MAX_CSE
+       range: [1-2], [3-5], [6-10], [11-16], [17-24], [25-MAX_CSE].
+       Prevents the training distribution from being dominated by narrow
+       methods (which vastly outnumber wide methods in real code).
+    2. **Heuristic behavior**: 4 buckets by ``heur_perf / no_cse_perf``:
+       - A: heuristic did nothing (``heur >= 0.995 * no_cse``)
+       - B: heuristic helped modestly (``0.95 * no_cse <= heur < 0.995 * no_cse``)
+       - C: heuristic helped substantially (``0.80 <= heur < 0.95``)
+       - D: heuristic helped dramatically (``heur < 0.80``)
+       Ensures the training set includes the "heur does nothing" class
+       (11 of 18 persistent worst-cases pre-fix were this pattern) and
+       the "heur does a lot" class (where the RL must learn extensive
+       CSE application).
+
+    Total 24 cells; target ~``want // 24`` methods per cell. Requires an
+    extra JIT call per acceptable scanned method (to establish the
+    heuristic baseline for bucketing), so scanning is slower than the
+    single-axis path.
     """
     if not stratified:
         keeps: List[MethodContext] = []
         for idx in range(1, scan_limit + 1):
+            if skip_indices is not None and idx in skip_indices:
+                continue
             try:
                 ctx = spmi.jit_method(idx, JitMetrics=1, JitRLHook=1,
                                       JitRLHookEmitFeatureNames=1,
@@ -121,38 +145,85 @@ def _pick_methods(spmi: SuperPmi, scan_limit: int, want: int,
                 break
         return keeps
 
-    # Stratified path: fill four candidate-count buckets in parallel.
-    buckets = ((1, 3), (4, 6), (7, 10), (11, 16))
-    per_bucket = max(1, want // len(buckets))
-    holds: List[List[MethodContext]] = [[] for _ in buckets]
+    # Two-axis stratified path: 6 cand-count buckets x 4 heur-behavior buckets.
+    cand_buckets = ((1, 2), (3, 5), (6, 10), (11, 16), (17, 24), (25, MAX_CSE))
+    heur_labels = ("A_nothing", "B_modest", "C_substantial", "D_dramatic")
+    n_cells = len(cand_buckets) * len(heur_labels)
+    per_cell = max(1, want // n_cells)
 
-    def bucket_of(n: int) -> int:
-        for i, (lo, hi) in enumerate(buckets):
+    # cells[(cand_bucket_idx, heur_bucket_idx)] -> list of MethodContext
+    cells: Dict[Tuple[int, int], List[MethodContext]] = {}
+    for ci in range(len(cand_buckets)):
+        for hi in range(len(heur_labels)):
+            cells[(ci, hi)] = []
+
+    def cand_bucket_of(n: int) -> int:
+        for i, (lo, hi) in enumerate(cand_buckets):
             if lo <= n <= hi:
                 return i
         return -1
 
+    def heur_bucket_of(heur_ps: float, no_cse_ps: float) -> int:
+        # Guard: perf-scores of ~0 shouldn't happen for real methods; treat
+        # as "heur did nothing" if the ratio can't be computed.
+        if no_cse_ps <= 0:
+            return 0
+        ratio = heur_ps / no_cse_ps
+        if ratio >= 0.995:
+            return 0  # A: nothing
+        if ratio >= 0.95:
+            return 1  # B: modest
+        if ratio >= 0.80:
+            return 2  # C: substantial
+        return 3      # D: dramatic
+
     for idx in range(1, scan_limit + 1):
-        # Stop if every bucket is full.
-        if all(len(h) >= per_bucket for h in holds):
+        if skip_indices is not None and idx in skip_indices:
+            continue
+        # Stop if every cell is full.
+        if all(len(v) >= per_cell for v in cells.values()):
             break
         try:
+            # Step 1: get features + no_cse baseline (empty CSE list).
             ctx = spmi.jit_method(idx, JitMetrics=1, JitRLHook=1,
                                   JitRLHookEmitFeatureNames=1,
                                   JitRLHookCSEDecisions=[])
         except Exception as exc:  # noqa: BLE001
-            print(f"  idx={idx}: jit failed ({type(exc).__name__}: {exc}); skipping")
+            print(f"  idx={idx}: jit(RLHook) failed ({type(exc).__name__}: {exc}); skipping")
             continue
         if ctx is None or not is_acceptable_for_cse(ctx):
             continue
-        b = bucket_of(ctx.num_cse_candidate)
-        if b < 0 or len(holds[b]) >= per_bucket:
-            continue
-        holds[b].append(ctx)
 
-    picked = [m for h in holds for m in h]
-    print(f"  stratified picks per bucket: "
-          f"{[f'{buckets[i][0]}-{buckets[i][1]}={len(h)}' for i, h in enumerate(holds)]}")
+        # Bail early if the cand bucket is already full — avoid the second
+        # (heuristic) JIT call which is the expensive part.
+        ci = cand_bucket_of(ctx.num_cse_candidate)
+        if ci < 0:
+            continue
+        if all(len(cells[(ci, hi)]) >= per_cell for hi in range(len(heur_labels))):
+            continue
+
+        # Step 2: heuristic baseline (no RLHook, uses default CSE_Heuristic).
+        try:
+            heur = spmi.jit_method(idx, JitMetrics=1)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  idx={idx}: jit(heuristic) failed ({type(exc).__name__}: {exc}); skipping")
+            continue
+        if heur is None:
+            continue
+
+        hi = heur_bucket_of(heur.perf_score, ctx.perf_score)
+        if len(cells[(ci, hi)]) >= per_cell:
+            continue
+        cells[(ci, hi)].append(ctx)
+
+    picked = [m for cell in cells.values() for m in cell]
+    print(f"  two-axis stratified picks (cand_bucket x heur_bucket, target={per_cell}/cell):")
+    for ci, (lo, hi_c) in enumerate(cand_buckets):
+        row = "    "
+        for hii, hlabel in enumerate(heur_labels):
+            row += f"cand[{lo}-{hi_c}]:{hlabel[0]}={len(cells[(ci, hii)]):>3d}  "
+        print(row)
+    print(f"  total picked: {len(picked)}")
     return picked
 
 
@@ -197,12 +268,19 @@ def main() -> int:
     args = _parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    skip_indices: Optional[set] = None
+    if args.skip_indices:
+        with open(args.skip_indices, encoding="utf-8") as f:
+            skip_indices = {int(line.strip()) for line in f if line.strip()}
+        print(f"      loaded {len(skip_indices)} indices to skip from {args.skip_indices}")
+
     print(f"[1/5] scanning up to {args.scan_limit} methods for {args.num_methods} "
           f"CSE-eligible candidates...")
     t0 = time.time()
     with SuperPmi(args.mch, args.core_root) as spmi:
         picked = _pick_methods(spmi, args.scan_limit, args.num_methods,
-                               stratified=not args.no_stratify)
+                               stratified=not args.no_stratify,
+                               skip_indices=skip_indices)
     print(f"      picked {len(picked)} methods in {time.time()-t0:.1f}s")
 
     if len(picked) < 3:
