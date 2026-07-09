@@ -77,6 +77,14 @@ class LinearPerCandidateExtractor(BaseFeaturesExtractor):
         self._max_cse, self._per_cand_feats = cand_space.shape
         self._method_feats = method_space.shape[0]
 
+        # Real methods can have more than ``_max_cse`` viable CSE candidates
+        # (training pool filters to <=MAX_CSE via ``is_acceptable_for_cse``,
+        # but at inference time we may see wider methods). ``forward`` will
+        # slice down to the first ``_max_cse`` rows so the output width
+        # remains ``_max_cse + 1`` regardless of the actual candidate count.
+        # The action space is Discrete(_max_cse + 1) so we can only address
+        # the first _max_cse candidates anyway.
+
         out_dim = self._max_cse + 1  # 16 candidate scores + 1 stop score
         super().__init__(observation_space, features_dim=out_dim)
 
@@ -87,8 +95,27 @@ class LinearPerCandidateExtractor(BaseFeaturesExtractor):
         self.stop_scorer = nn.Linear(self._method_feats, 1)
 
     def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:  # type: ignore[override]
-        cands = observations["candidates"]  # (B, max_cse, per_cand_feats)
+        cands = observations["candidates"]  # (B, seq_len, per_cand_feats)
         method = observations["method"]     # (B, method_feats)
+
+        # Slice to at most ``_max_cse`` rows so the extractor's output
+        # width is always ``_max_cse + 1``. Real methods can have more
+        # viable candidates than MAX_CSE at inference; the action space
+        # (Discrete(MAX_CSE+1)) can only address the first MAX_CSE
+        # anyway, so dropping the tail is consistent.
+        if cands.size(1) > self._max_cse:
+            cands = cands[:, : self._max_cse, :]
+        elif cands.size(1) < self._max_cse:
+            # Pad with zeros to reach MAX_CSE (matches ``get_observation``
+            # padding convention).
+            pad = torch.zeros(
+                cands.size(0),
+                self._max_cse - cands.size(1),
+                cands.size(2),
+                dtype=cands.dtype,
+                device=cands.device,
+            )
+            cands = torch.cat([cands, pad], dim=1)
 
         # Score every candidate with the shared linear head. The `Linear`
         # module broadcasts over the leading batch+candidate dims.
