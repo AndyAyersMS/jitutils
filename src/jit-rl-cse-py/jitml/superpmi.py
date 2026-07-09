@@ -128,7 +128,15 @@ class SuperPmi:
         output = ""
 
         while not output.startswith('[streaming] Done.'):
-            output = process.stdout.readline().decode('utf-8').strip()
+            line = process.stdout.readline()
+            # An empty read means EOF -- superpmi has closed stdout, either
+            # because it exited normally (unusual mid-request) or crashed.
+            # Return None so the caller's retry loop can restart the process
+            # and skip past the problematic method. Without this guard the
+            # loop hangs forever waiting for output that will never arrive.
+            if not line:
+                return None
+            output = line.decode('utf-8').strip()
             if output.startswith(';'):
                 result = self._parse_method_context(output)
 
