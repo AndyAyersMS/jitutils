@@ -274,25 +274,32 @@ def main() -> int:
     t0 = time.time()
 
     if args.parallel and args.parallel > 1:
-        # Round-robin slice the id list across N workers so each worker's
-        # workload has similar distribution over candidate counts.
-        chunks: List[List[int]] = [[] for _ in range(args.parallel)]
-        for i, mid in enumerate(ids):
-            chunks[i % args.parallel].append(mid)
+        # Dynamic work distribution: submit MANY small task chunks and let
+        # ProcessPoolExecutor's internal scheduler pick them up. Static
+        # 1/N slicing (previous approach) caused wall-clock imbalance
+        # when one slice happened to draw all the MCMC-requiring wide
+        # methods -- other workers would finish and idle for many
+        # minutes waiting for the slow one. Small chunks keep IPC
+        # overhead low while enabling work stealing.
+        chunk_size = max(1, min(20, len(ids) // (args.parallel * 4) + 1))
+        chunks: List[List[int]] = []
+        for i in range(0, len(ids), chunk_size):
+            chunks.append(ids[i:i + chunk_size])
+        print(f"  {len(chunks)} chunks of ~{chunk_size} methods across {args.parallel} workers")
         with cf.ProcessPoolExecutor(max_workers=args.parallel) as pool:
             futures = [
                 pool.submit(_worker, args.mch, args.core_root, chunk,
                             args.exhaustive_cutoff, args.mcmc_trials,
-                            args.seed + wi)
-                for wi, chunk in enumerate(chunks)
+                            args.seed + ci)
+                for ci, chunk in enumerate(chunks)
             ]
             for i, fut in enumerate(cf.as_completed(futures)):
                 sub = fut.result()
                 labels.update(sub)
-                print(f"  worker {i+1}/{args.parallel} done ({len(sub)} labels, "
-                      f"total={len(labels)}, elapsed {time.time()-t0:.1f}s)")
-                # Incremental save on each worker completion.
-                _save_json(args.out, labels)
+                if (i + 1) % 4 == 0 or (i + 1) == len(futures):
+                    print(f"  chunk {i+1}/{len(chunks)} done ({len(sub)} labels, "
+                          f"total={len(labels)}, elapsed {time.time()-t0:.1f}s)")
+                    _save_json(args.out, labels)
     else:
         rng = random.Random(args.seed)
         with SuperPmi(args.mch, args.core_root) as spmi:
