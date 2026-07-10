@@ -102,6 +102,12 @@ def _parse_args() -> argparse.Namespace:
                    help="Random seed for MCMC trial subset generation (default 42).")
     p.add_argument("--resume", action="store_true",
                    help="If --out already exists, load it and skip methods already labeled.")
+    p.add_argument("--bbinstr-sample-rate", type=float, default=1.0,
+                   help="Down-sample rate for methods compiled as 'Instrumented Tier1' "
+                        "(BBINSTR flag). These methods are still tier1 PGO-optimized but "
+                        "are being additionally instrumented for future profile refinement, "
+                        "which is less interesting for CSE training. Default 1.0 keeps all; "
+                        "e.g. 0.3 keeps 30 pct of Instrumented Tier1 methods.")
     return p.parse_args()
 
 
@@ -122,9 +128,16 @@ def _score_subset(spmi: SuperPmi, method_id: int, subset: List[int]) -> Optional
 
 
 def _label_method(spmi: SuperPmi, method_id: int, exhaustive_cutoff: int,
-                  mcmc_trials: int, rng: random.Random) -> Optional[Dict]:
+                  mcmc_trials: int, rng: random.Random,
+                  bbinstr_sample_rate: float = 1.0) -> Optional[Dict]:
     """Compute the optimal-subset label for one method. Returns None if
-    the method has no viable candidates or the initial JIT fails."""
+    the method has no viable candidates or the initial JIT fails.
+
+    When ``bbinstr_sample_rate < 1.0``, methods compiled as
+    'Instrumented Tier1' (BBINSTR flag; still tier1 PGO-optimized but
+    also being instrumented for future profile refinement) are randomly
+    dropped so the training set is biased toward pure Tier1 methods.
+    """
     try:
         no_cse = spmi.jit_method(method_id, JitMetrics=1, JitRLHook=1,
                                  JitRLHookEmitFeatureNames=1,
@@ -133,6 +146,11 @@ def _label_method(spmi: SuperPmi, method_id: int, exhaustive_cutoff: int,
         return None
     if no_cse is None:
         return None
+
+    # Bias against Instrumented Tier1 (BBINSTR) methods if requested.
+    if bbinstr_sample_rate < 1.0 and no_cse.compile_mode == "Instrumented Tier1":
+        if rng.random() >= bbinstr_sample_rate:
+            return None
 
     viable = _viable_indices(no_cse)
     if not viable:
@@ -292,7 +310,8 @@ def _resolve_indices(mch: str, core_root: str, indices_file: Optional[str],
 
 
 def _worker(mch: str, core_root: str, method_ids: List[int],
-            exhaustive_cutoff: int, mcmc_trials: int, seed: int) -> Dict[str, Dict]:
+            exhaustive_cutoff: int, mcmc_trials: int, seed: int,
+            bbinstr_sample_rate: float = 1.0) -> Dict[str, Dict]:
     """One process-pool worker: label a slice of methods."""
     import sys
     rng = random.Random(seed)
@@ -303,7 +322,8 @@ def _worker(mch: str, core_root: str, method_ids: List[int],
             # a status check reveals the exact trigger (worker-level log
             # + os.getpid).
             print(f"    [pid {os.getpid()}] method {method_id}", flush=True)
-            label = _label_method(spmi, method_id, exhaustive_cutoff, mcmc_trials, rng)
+            label = _label_method(spmi, method_id, exhaustive_cutoff, mcmc_trials,
+                                  rng, bbinstr_sample_rate=bbinstr_sample_rate)
             if label is not None:
                 out[str(method_id)] = label
     return out
@@ -348,7 +368,7 @@ def main() -> int:
             futures = [
                 pool.submit(_worker, args.mch, args.core_root, chunk,
                             args.exhaustive_cutoff, args.mcmc_trials,
-                            args.seed + ci)
+                            args.seed + ci, args.bbinstr_sample_rate)
                 for ci, chunk in enumerate(chunks)
             ]
             for i, fut in enumerate(cf.as_completed(futures)):
@@ -363,7 +383,8 @@ def main() -> int:
         with SuperPmi(args.mch, args.core_root) as spmi:
             for i, method_id in enumerate(ids):
                 label = _label_method(spmi, method_id, args.exhaustive_cutoff,
-                                      args.mcmc_trials, rng)
+                                      args.mcmc_trials, rng,
+                                      bbinstr_sample_rate=args.bbinstr_sample_rate)
                 if label is not None:
                     labels[str(method_id)] = label
                 if (i + 1) % 25 == 0:
