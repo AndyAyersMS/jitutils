@@ -81,6 +81,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--attention", action="store_true",
                         help="Use the AttentionOverCandidatesExtractor custom SB3 policy "
                              "(requires PPO or A2C).")
+    parser.add_argument("--attention-separate-stop-head", action="store_true",
+                        help="With --attention, use a separate stop-action scorer over "
+                             "method-level features (instead of sharing the candidate "
+                             "head). Targets the 'compulsive firing on A_nothing' pattern "
+                             "diagnosed post-C4: with a shared head, the stop logit is a "
+                             "function of pooled candidate features, so any non-trivial "
+                             "candidate suppresses stop probability regardless of whether "
+                             "stopping is actually right. Splits the decision cleanly.")
     parser.add_argument("--linear-scorer", action="store_true",
                         help="Use the RL2020-style LinearPerCandidateExtractor: shared linear "
                              "scorer across candidates + separate scorer for the stop action. "
@@ -280,6 +288,14 @@ def main() -> int:
     args = _parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    if args.attention_separate_stop_head and not args.attention:
+        print("FAIL: --attention-separate-stop-head requires --attention.", file=sys.stderr)
+        return 2
+    if args.attention_separate_stop_head and args.net_arch is not None:
+        print("FAIL: --attention-separate-stop-head forces net_arch=[] so cannot be "
+              "combined with --net-arch.", file=sys.stderr)
+        return 2
+
     skip_indices: Optional[set] = None
     if args.skip_indices:
         with open(args.skip_indices, encoding="utf-8") as f:
@@ -347,12 +363,18 @@ def main() -> int:
     if args.net_arch is not None:
         net_arch = [int(x) for x in args.net_arch.split(",") if x.strip() != ""]
 
+    attention_kwargs = {}
+    if args.attention_separate_stop_head:
+        attention_kwargs["use_separate_stop_head"] = True
+
     model = JitCseModel(args.algorithm, use_attention=args.attention,
                         use_linear_scorer=args.linear_scorer,
                         ent_coef=args.ent_coef, clip_range=args.clip_range,
-                        net_arch=net_arch)
+                        net_arch=net_arch,
+                        attention_kwargs=attention_kwargs)
     if args.attention:
-        print(f"      + AttentionOverCandidatesExtractor ({args.algorithm})")
+        stop_head = " + separate stop head" if args.attention_separate_stop_head else ""
+        print(f"      + AttentionOverCandidatesExtractor{stop_head} ({args.algorithm})")
     if args.linear_scorer:
         print(f"      + LinearPerCandidateExtractor ({args.algorithm})")
     if net_arch is not None:

@@ -57,6 +57,7 @@ class AttentionOverCandidatesExtractor(BaseFeaturesExtractor):
         num_heads: int = 4,
         num_attn_layers: int = 1,
         dropout: float = 0.0,
+        use_separate_stop_head: bool = False,
     ):
         if not isinstance(observation_space, gym.spaces.Dict):
             raise TypeError(
@@ -69,13 +70,30 @@ class AttentionOverCandidatesExtractor(BaseFeaturesExtractor):
                 "Observation space must have 'candidates' and 'method' keys."
             )
 
-        super().__init__(observation_space, features_dim=features_dim)
-
         cand_space = observation_space.spaces["candidates"]
         method_space = observation_space.spaces["method"]
-        self._max_cse = cand_space.shape[0]
+        max_cse = cand_space.shape[0]
+
+        # When ``use_separate_stop_head=True`` this extractor emits
+        # (batch, max_cse+1) logits directly -- one per candidate plus
+        # one for the stop action. Callers should then set
+        # ``net_arch=[]`` on the policy so SB3's action_net becomes a
+        # linear pass-through (Linear(max_cse+1, max_cse+1)). The
+        # decoupled stop-scorer is a targeted fix for the "compulsive
+        # firing on A_nothing" pattern observed in C4/C4-ext: with a
+        # shared candidate/stop head, the stop logit was learned as a
+        # function of pooled candidate features, so methods with any
+        # non-trivial candidate got a low stop probability regardless
+        # of whether stopping was actually the right call.
+        if use_separate_stop_head:
+            features_dim = max_cse + 1
+
+        super().__init__(observation_space, features_dim=features_dim)
+
+        self._max_cse = max_cse
         self._per_cand_feats = cand_space.shape[1]
         self._method_feats = method_space.shape[0]
+        self._use_separate_stop_head = use_separate_stop_head
 
         if embed_dim % num_heads != 0:
             raise ValueError(
@@ -98,10 +116,20 @@ class AttentionOverCandidatesExtractor(BaseFeaturesExtractor):
         )
         self.attn = nn.TransformerEncoder(encoder_layer, num_layers=num_attn_layers)
 
-        self.head = nn.Sequential(
-            nn.Linear(embed_dim * 2, features_dim),
-            nn.ReLU(),
-        )
+        if use_separate_stop_head:
+            # Per-candidate scorer over post-attention embeddings; one
+            # scalar per candidate.
+            self.candidate_scorer = nn.Linear(embed_dim, 1)
+            # Stop scorer reads ONLY method-level features -- keeps the
+            # stop decision from being blurred by mean-pooled candidate
+            # noise. Rationale mirrors LinearPerCandidateExtractor's
+            # split.
+            self.stop_scorer = nn.Linear(self._method_feats, 1)
+        else:
+            self.head = nn.Sequential(
+                nn.Linear(embed_dim * 2, features_dim),
+                nn.ReLU(),
+            )
 
     def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:  # type: ignore[override]
         cands = observations["candidates"]  # (batch, max_cse, per_cand_feats)
@@ -119,6 +147,13 @@ class AttentionOverCandidatesExtractor(BaseFeaturesExtractor):
 
         cand_emb = self.candidate_embed(cands)          # (batch, max_cse, embed_dim)
         cand_out = self.attn(cand_emb, src_key_padding_mask=padding_mask)
+
+        if self._use_separate_stop_head:
+            # Per-candidate score = Linear(embed_dim, 1) on attention
+            # outputs. Concatenate the method-level stop score.
+            cand_scores = self.candidate_scorer(cand_out).squeeze(-1)  # (batch, max_cse)
+            stop_score = self.stop_scorer(method)                      # (batch, 1)
+            return torch.cat([cand_scores, stop_score], dim=-1)         # (batch, max_cse+1)
 
         # Mean-pool over real candidates only (denominator = # non-padding
         # rows). Guard against divide-by-zero for the (theoretical)
@@ -138,12 +173,24 @@ def make_attention_policy_kwargs(
     num_heads: int = 4,
     num_attn_layers: int = 1,
     net_arch: Optional[Any] = None,
+    use_separate_stop_head: bool = False,
 ) -> Dict[str, Any]:
     """Convenience builder for ``policy_kwargs`` passed to PPO/A2C.
 
     Set ``net_arch`` to something small (e.g. ``[64]``) since most of
     the modeling capacity now lives in the attention extractor.
+
+    When ``use_separate_stop_head=True`` the extractor emits action
+    logits directly (features_dim == max_cse+1); ``net_arch`` is forced
+    to ``[]`` so SB3's action_net is a linear pass-through.
     """
+    if use_separate_stop_head:
+        # Extractor produces max_cse+1 logits already; do NOT add an
+        # MLP head or the shared/stop split is lost inside SB3's
+        # subsequent action_net + hidden layers.
+        arch = []
+    else:
+        arch = net_arch if net_arch is not None else [64]
     return {
         "features_extractor_class": AttentionOverCandidatesExtractor,
         "features_extractor_kwargs": {
@@ -151,8 +198,9 @@ def make_attention_policy_kwargs(
             "embed_dim": embed_dim,
             "num_heads": num_heads,
             "num_attn_layers": num_attn_layers,
+            "use_separate_stop_head": use_separate_stop_head,
         },
-        "net_arch": net_arch if net_arch is not None else [64],
+        "net_arch": arch,
     }
 
 

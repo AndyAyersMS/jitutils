@@ -114,3 +114,67 @@ def test_extractor_rejects_bad_head_count():
     space = _dict_space()
     with pytest.raises(ValueError):
         AttentionOverCandidatesExtractor(space, features_dim=64, embed_dim=64, num_heads=7)
+
+
+def test_extractor_separate_stop_head_output_shape():
+    """With use_separate_stop_head=True the extractor emits max_cse+1
+    logits directly: one per candidate, one for stop."""
+    from jitml.attention_policy import AttentionOverCandidatesExtractor
+
+    space = _dict_space(max_cse=16, per_cand=17, method_feats=5)
+    extractor = AttentionOverCandidatesExtractor(
+        space, features_dim=128, embed_dim=64, num_heads=4,
+        use_separate_stop_head=True,
+    )
+    # features_dim is forced to max_cse+1 regardless of what we passed.
+    assert extractor.features_dim == 17
+
+    batch = 3
+    obs = {
+        "candidates": torch.rand(batch, 16, 17),
+        "method":     torch.rand(batch, 5),
+    }
+    out = extractor(obs)
+    assert out.shape == (batch, 17)
+    assert torch.all(torch.isfinite(out))
+
+
+def test_extractor_separate_stop_head_stop_score_is_method_only():
+    """The stop logit must be a function ONLY of method features -- it
+    must be identical for two batch elements that differ only in
+    candidate rows."""
+    from jitml.attention_policy import AttentionOverCandidatesExtractor
+
+    space = _dict_space(max_cse=16, per_cand=17, method_feats=5)
+    extractor = AttentionOverCandidatesExtractor(
+        space, features_dim=128, embed_dim=32, num_heads=4,
+        use_separate_stop_head=True,
+    )
+    extractor.eval()
+
+    method = torch.rand(1, 5)
+    cands_a = torch.rand(1, 16, 17)
+    cands_b = torch.rand(1, 16, 17)  # completely different candidates
+    out_a = extractor({"candidates": cands_a, "method": method})
+    out_b = extractor({"candidates": cands_b, "method": method})
+    # Last column = stop score; must match to high precision.
+    assert torch.allclose(out_a[:, -1], out_b[:, -1], atol=1e-6)
+    # Candidate scores DIFFER (would be strange if they didn't).
+    assert not torch.allclose(out_a[:, :-1], out_b[:, :-1], atol=1e-4)
+
+
+def test_make_attention_policy_kwargs_separate_stop_forces_empty_net_arch():
+    """When use_separate_stop_head=True the extractor emits action-space-
+    shaped logits; the returned policy_kwargs must set net_arch=[] so
+    SB3's action_net is a linear pass-through, otherwise a hidden MLP
+    would re-mix the carefully-separated candidate/stop logits."""
+    from jitml.attention_policy import make_attention_policy_kwargs
+
+    kw = make_attention_policy_kwargs(use_separate_stop_head=True)
+    assert kw["net_arch"] == []
+    assert kw["features_extractor_kwargs"]["use_separate_stop_head"] is True
+
+    # Default keeps net_arch=[64] as before.
+    kw_default = make_attention_policy_kwargs()
+    assert kw_default["net_arch"] == [64]
+    assert kw_default["features_extractor_kwargs"]["use_separate_stop_head"] is False
