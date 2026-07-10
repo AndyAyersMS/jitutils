@@ -18,6 +18,7 @@ _LAZY_EXPORTS = {
     "OptimalCseWrapper":        ("jitml.wrappers",        "OptimalCseWrapper"),
     "NormalizeFeaturesWrapper": ("jitml.wrappers",        "NormalizeFeaturesWrapper"),
     "DeltaVsHeuristicRewardWrapper": ("jitml.wrappers",   "DeltaVsHeuristicRewardWrapper"),
+    "HardStopRewardWrapper":    ("jitml.wrappers",        "HardStopRewardWrapper"),
     "AttentionOverCandidatesExtractor": ("jitml.attention_policy", "AttentionOverCandidatesExtractor"),
     "make_attention_policy_kwargs":     ("jitml.attention_policy", "make_attention_policy_kwargs"),
     "get_individual_cse_perf":  ("jitml.cse_decisions",   "get_individual_cse_perf"),
@@ -36,7 +37,7 @@ def __getattr__(name):
 if TYPE_CHECKING:  # help static analyzers see the lazy exports
     from .jit_cse import JitCseEnv
     from .machine_learning import JitCseModel
-    from .wrappers import OptimalCseWrapper, NormalizeFeaturesWrapper, DeltaVsHeuristicRewardWrapper
+    from .wrappers import OptimalCseWrapper, NormalizeFeaturesWrapper, DeltaVsHeuristicRewardWrapper, HardStopRewardWrapper
     from .attention_policy import AttentionOverCandidatesExtractor, make_attention_policy_kwargs
     from .cse_decisions import get_individual_cse_perf, get_multi_cse_perf
 
@@ -54,6 +55,7 @@ __all__ = [
     "OptimalCseWrapper",
     "NormalizeFeaturesWrapper",
     "DeltaVsHeuristicRewardWrapper",
+    "HardStopRewardWrapper",
     "AttentionOverCandidatesExtractor",
     "make_attention_policy_kwargs",
     "get_individual_cse_perf",

@@ -63,6 +63,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--delta-reward", action="store_true",
                         help="Wrap the env with DeltaVsHeuristicRewardWrapper "
                              "(episode-end shaping term = (heuristic - final) / heuristic).")
+    parser.add_argument("--hard-stop-reward", action="store_true",
+                        help="Wrap the env with HardStopRewardWrapper: replaces per-step "
+                             "reward with a pure episode-end signal (heur - final)/heur, "
+                             "with asymmetric penalty for regressions. Targets the "
+                             "'fire on A_nothing' pattern where per-step reward mis-teaches "
+                             "the policy that firing one CSE is safe.")
+    parser.add_argument("--hard-stop-scale", type=float, default=1.0,
+                        help="Scale for HardStopRewardWrapper improvement reward "
+                             "(default 1.0).")
+    parser.add_argument("--hard-stop-asym", type=float, default=2.0,
+                        help="Multiplier for HardStopRewardWrapper regression penalty "
+                             "(default 2.0, i.e. regressions weighted 2x improvements).")
     parser.add_argument("--optimal-reward", action="store_true",
                         help="Wrap the env with OptimalCseWrapper (per-step reward against best-of-"
                              "alternatives; densifies the reward signal but adds ~4-5x per-step JIT cost).")
@@ -303,7 +315,9 @@ def main() -> int:
 
     print("[4/5] constructing JitCseEnv + PPO...")
     from jitml import JitCseEnv, JitCseModel  # lazy-imports torch/SB3
-    from jitml import NormalizeFeaturesWrapper, DeltaVsHeuristicRewardWrapper, OptimalCseWrapper
+    from jitml import (NormalizeFeaturesWrapper, DeltaVsHeuristicRewardWrapper,
+                       HardStopRewardWrapper, OptimalCseWrapper)
+    from functools import partial
     ctx = SuperPmiContext(core_root=args.core_root, mch=args.mch)
     # Load the split we just wrote; use the train side.
     _, train_ids = SuperPmiCache.get_test_train_methods(args.mch, args.core_root)
@@ -319,6 +333,12 @@ def main() -> int:
     if args.delta_reward:
         wrappers.append(DeltaVsHeuristicRewardWrapper)
         print("      + DeltaVsHeuristicRewardWrapper")
+    if args.hard_stop_reward:
+        wrappers.append(partial(HardStopRewardWrapper,
+                                scale=args.hard_stop_scale,
+                                asym_penalty=args.hard_stop_asym))
+        print(f"      + HardStopRewardWrapper (scale={args.hard_stop_scale:g}, "
+              f"asym_penalty={args.hard_stop_asym:g})")
     if args.optimal_reward:
         wrappers.append(OptimalCseWrapper)
         print("      + OptimalCseWrapper (dense per-step reward; ~4-5x per-step JIT cost)")

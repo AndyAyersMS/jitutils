@@ -281,3 +281,109 @@ def test_get_observation_produces_dict_with_correct_shapes():
         obs["method"],
         np.array([42, 7, 3, 1, 0, 50000, 100000, 0, 0, 0, 0, 0], dtype=np.float32),
     )
+
+
+class _StubTerminatingEnv(gym.Env):
+    """A one-step env used to unit-test reward wrappers.
+
+    ``step`` returns ``(obs, base_reward, terminated=True, ...)`` with the
+    ``final_score``/``heuristic_score`` fields wrappers expect. The
+    fields are configurable per instance.
+    """
+
+    def __init__(self, heur, final, base_reward=0.5):
+        super().__init__()
+        self.action_space = gym.spaces.Discrete(2)
+        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+        self._heur = heur
+        self._final = final
+        self._base = float(base_reward)
+
+    def reset(self, *, seed=None, options=None):
+        return np.zeros(1, dtype=np.float32), {}
+
+    def step(self, action):
+        info = {'heuristic_score': self._heur, 'final_score': self._final}
+        return np.zeros(1, dtype=np.float32), self._base, True, False, info
+
+
+def test_hard_stop_reward_zero_when_final_equals_heuristic():
+    """When the policy hits the heuristic exactly (e.g. stopped immediately
+    on an A_nothing method), the shaping reward is 0."""
+    from jitml.wrappers import HardStopRewardWrapper
+    env = _StubTerminatingEnv(heur=100.0, final=100.0, base_reward=0.5)
+    wrapped = HardStopRewardWrapper(env, scale=1.0, asym_penalty=2.0)
+    _, reward, terminated, _, _ = wrapped.step(0)
+    assert terminated
+    # Wrapper OVERRIDES the base reward with pure episode-end signal.
+    assert reward == 0.0
+
+
+def test_hard_stop_reward_positive_for_improvement():
+    """Improving on the heuristic yields a positive reward scaled by ``scale``."""
+    from jitml.wrappers import HardStopRewardWrapper
+    env = _StubTerminatingEnv(heur=100.0, final=90.0)
+    wrapped = HardStopRewardWrapper(env, scale=1.0, asym_penalty=2.0)
+    _, reward, terminated, _, _ = wrapped.step(0)
+    assert terminated
+    # (100 - 90) / 100 * 1.0 = 0.1
+    assert reward == 0.1
+
+
+def test_hard_stop_reward_asymmetric_penalty_for_regression():
+    """Regressing against the heuristic yields a penalty scaled by
+    ``asym_penalty`` — larger than the improvement scale by design."""
+    from jitml.wrappers import HardStopRewardWrapper
+    env = _StubTerminatingEnv(heur=100.0, final=110.0)  # 10% WORSE
+    wrapped = HardStopRewardWrapper(env, scale=1.0, asym_penalty=2.0)
+    _, reward, terminated, _, _ = wrapped.step(0)
+    assert terminated
+    # (100 - 110)/100 * 2.0 = -0.2 (2x the +0.1 you'd get for a 10% improvement)
+    assert reward == -0.2
+
+
+def test_hard_stop_reward_non_terminal_step_is_zero():
+    """Non-terminal steps yield zero reward regardless of what the base
+    env would report; the wrapper only speaks at episode end."""
+    from jitml.wrappers import HardStopRewardWrapper
+
+    class NonTermEnv(gym.Env):
+        action_space = gym.spaces.Discrete(2)
+        observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+        def reset(self, *, seed=None, options=None):
+            return np.zeros(1, dtype=np.float32), {}
+        def step(self, action):
+            return np.zeros(1, dtype=np.float32), 0.7, False, False, {}
+
+    wrapped = HardStopRewardWrapper(NonTermEnv())
+    _, reward, terminated, _, _ = wrapped.step(0)
+    assert not terminated
+    assert reward == 0.0
+
+
+def test_hard_stop_reward_scale_and_asym_configurable():
+    """``scale`` and ``asym_penalty`` are wired through the constructor."""
+    from jitml.wrappers import HardStopRewardWrapper
+
+    env_good = _StubTerminatingEnv(heur=100.0, final=95.0)
+    wrapped = HardStopRewardWrapper(env_good, scale=5.0, asym_penalty=10.0)
+    _, reward, _, _, _ = wrapped.step(0)
+    # (100-95)/100 * 5.0 = 0.25
+    assert reward == 0.25
+
+    env_bad = _StubTerminatingEnv(heur=100.0, final=105.0)
+    wrapped_bad = HardStopRewardWrapper(env_bad, scale=5.0, asym_penalty=10.0)
+    _, reward_bad, _, _, _ = wrapped_bad.step(0)
+    # (100-105)/100 * 10.0 = -0.5
+    assert reward_bad == -0.5
+
+
+def test_hard_stop_reward_ignores_zero_heuristic():
+    """Guard against divide-by-zero when heuristic_score <= 0 (edge case
+    that shouldn't happen for real methods but is easy to be robust to)."""
+    from jitml.wrappers import HardStopRewardWrapper
+    env = _StubTerminatingEnv(heur=0.0, final=1.0)
+    wrapped = HardStopRewardWrapper(env)
+    _, reward, terminated, _, _ = wrapped.step(0)
+    assert terminated
+    assert reward == 0.0

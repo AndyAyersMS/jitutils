@@ -201,6 +201,66 @@ class NormalizeFeaturesWrapper(gym.ObservationWrapper):
         return out
 
 
+class HardStopRewardWrapper(gym.Wrapper):
+    """Reward-shaping wrapper for the "compulsive firing on A_nothing" pattern.
+
+    Diagnosis: on test methods where the JIT's default heuristic decides to
+    do nothing ("A_nothing" bucket, heur_score == no_cse_score), our
+    attention-based policy trained with per-step delta-vs-previous reward
+    still fires on 100% of them, costing >1% per method. The per-step
+    reward has an asymmetry: applying the FIRST CSE often gives a small
+    positive reward (the "hit and run" pattern), while overshoot only
+    shows up as a per-step negative later. The policy learns "fire once
+    and stop" as a modal strategy, which is wrong on the modal test A_nothing
+    method.
+
+    This wrapper replaces the per-step reward with a pure episode-end
+    signal that directly aligns with the eval metric::
+
+        reward = 0                                     for all non-terminal steps
+        reward = scale * (heur - final) / heur         if final <= heur (improvement)
+        reward = -asym_penalty * (final - heur) / heur if final >  heur (regression)
+
+    With ``asym_penalty > scale`` (default 2×), the policy is discouraged
+    from taking any action whose expected value straddles the heuristic —
+    aligning training reward with the actual "beat heuristic" objective.
+
+    Notes:
+    * Stops on step 0 (no CSEs applied) get reward = 0 (same as heuristic).
+      Under the previous per-step reward this was competitive with "fire
+      once and hope"; under this wrapper the "hope" arm now has a strictly
+      negative expected value whenever the applied CSE has a real chance
+      of overshooting, so the policy should learn to stop.
+    * Invalid/truncated episodes bypass the shaping (they never terminate
+      cleanly, so ``final_score`` is unset).
+    """
+
+    def __init__(self, env: JitCseEnv, scale: float = 1.0, asym_penalty: float = 2.0):
+        super().__init__(env)
+        self._scale = float(scale)
+        self._asym = float(asym_penalty)
+
+    def step(self, action):
+        observation, _base_reward, terminated, truncated, info = self.env.step(action)
+        if not terminated:
+            return observation, 0.0, terminated, truncated, info
+
+        if 'final_score' not in info or 'heuristic_score' not in info:
+            return observation, 0.0, terminated, truncated, info
+
+        heur = info['heuristic_score']
+        final = info['final_score']
+        if heur <= 0:
+            return observation, 0.0, terminated, truncated, info
+
+        delta = (heur - final) / heur
+        if delta >= 0:
+            reward = self._scale * delta
+        else:
+            reward = self._asym * delta
+        return observation, float(reward), terminated, truncated, info
+
+
 class DeltaVsHeuristicRewardWrapper(gym.Wrapper):
     """Reward-shaping wrapper: give the agent a per-episode bonus based on
     how it performs relative to the JIT's built-in heuristic.
@@ -235,5 +295,6 @@ __all__ = [
     NormalizeFeaturesWrapper.__name__,
     OptimalCseWrapper.__name__,
     DeltaVsHeuristicRewardWrapper.__name__,
+    HardStopRewardWrapper.__name__,
 ]
 
