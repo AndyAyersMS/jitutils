@@ -165,29 +165,72 @@ def _label_method(spmi: SuperPmi, method_id: int, exhaustive_cutoff: int,
                 best_subset = subset
     else:
         mode = "mcmc"
-        # Anchor points: empty and all-viable.
-        for subset in ([], list(viable)):
-            perf = _score_subset(spmi, method_id, subset)
-            n_tried += 1
-            if perf is not None and perf < best_perf:
-                best_perf = perf
-                best_subset = list(subset)
-        # Random subsets. Sample subset-size uniformly, then sample that
-        # many indices without replacement -- matches RLCSE's exploration
-        # bias toward moderate-sized sequences.
-        seen: Set[frozenset] = {frozenset(), frozenset(viable)}
-        while n_tried < mcmc_trials:
-            size = rng.randint(1, k - 1) if k > 1 else 1
-            subset = sorted(rng.sample(viable, size))
-            key = frozenset(subset)
+        seen: Set[frozenset] = set()
+
+        def try_subset(sub: List[int]) -> bool:
+            """Try ``sub``, update best if better, return True if it was a new best."""
+            nonlocal best_perf, best_subset, n_tried
+            key = frozenset(sub)
             if key in seen:
-                continue
+                return False
             seen.add(key)
-            perf = _score_subset(spmi, method_id, subset)
+            perf = _score_subset(spmi, method_id, sub)
             n_tried += 1
             if perf is not None and perf < best_perf:
                 best_perf = perf
-                best_subset = subset
+                best_subset = list(sub)
+                return True
+            return False
+
+        # Anchor points: empty and all-viable.
+        try_subset([])
+        try_subset(list(viable))
+
+        # HILL CLIMB from a "good" starting point (the heuristic's own
+        # choice, subset-intersected with viable). Randomly-initialized
+        # 512-trial search covers 1.5pct of 2^15 space -- likely misses
+        # the true optimum. Hill-climb explores O(k) neighbors per
+        # iteration, converges to a LOCAL optimum in <10 iters. To
+        # escape local optima, restart from random subsets between
+        # climbs. Combined coverage of local optima >> pure random.
+        heur_start = [i for i in viable if i in heur_cses] if heur_cses else []
+        # Additional starting points: heuristic subset, all-viable
+        # subset (already tried), and random subsets.
+        starts: List[List[int]] = [heur_start] if heur_start else []
+
+        # As many random starts as our budget allows. Reserve at least
+        # ``k+1`` trials per climb (init + k flip attempts). If we still
+        # have budget, restart.
+        est_climb_cost = k + 1
+        max_random_starts = max(1, (mcmc_trials - n_tried) // est_climb_cost - 1)
+        for _ in range(min(max_random_starts, 8)):  # cap at 8 random restarts
+            size = rng.randint(1, k)
+            starts.append(sorted(rng.sample(viable, size)))
+
+        for start in starts:
+            current = list(start)
+            try_subset(current)
+            improved = True
+            while improved and n_tried < mcmc_trials:
+                improved = False
+                # Try all single-bit flips (add/remove one CSE from the
+                # current subset). First-improvement acceptance.
+                current_set = set(current)
+                for c in viable:
+                    if n_tried >= mcmc_trials:
+                        break
+                    if c in current_set:
+                        candidate_subset = sorted(current_set - {c})
+                    else:
+                        candidate_subset = sorted(current_set | {c})
+                    if try_subset(candidate_subset):
+                        current = candidate_subset
+                        improved = True
+                        break  # first-improvement: restart flip loop
+            if n_tried >= mcmc_trials:
+                break
+
+        mode = "mcmc-hillclimb"
 
     return {
         "n_candidates": n,
@@ -213,22 +256,32 @@ def _resolve_indices(mch: str, core_root: str, indices_file: Optional[str],
     else:
         # Scan the MCH for methods with any candidates. Uses one throwaway
         # SPMI instance; caller-supplied ``scan_limit`` bounds the walk.
+        # Also stop after N CONSECUTIVE invalid indices, since indices
+        # past the MCH's end will each trigger a costly spmi restart.
         with SuperPmi(mch, core_root) as spmi:
             top = scan_limit if scan_limit else 10_000_000
+            consecutive_invalid = 0
+            MAX_CONSECUTIVE_INVALID = 30
             for idx in range(1, top + 1):
                 try:
                     m = spmi.jit_method(idx, JitMetrics=1, JitRLHook=1,
                                         JitRLHookEmitFeatureNames=1,
                                         JitRLHookCSEDecisions=[])
                 except Exception:  # noqa: BLE001
+                    consecutive_invalid += 1
                     if idx > 100 and not ids:
-                        # Assume we're past the MCH's method range.
-                        break
+                        break  # never found any -- probably no methods
+                    if consecutive_invalid >= MAX_CONSECUTIVE_INVALID:
+                        break  # past end of MCH
                     continue
                 if m is None:
+                    consecutive_invalid += 1
                     if idx > 100 and not ids:
                         break
+                    if consecutive_invalid >= MAX_CONSECUTIVE_INVALID:
+                        break
                     continue
+                consecutive_invalid = 0
                 if _viable_indices(m):
                     ids.append(idx)
     if already_done:
