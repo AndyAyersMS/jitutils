@@ -114,6 +114,7 @@ def _rollout(superpmi: SuperPmi, jitrl: JitCseModel, method_id: int,
 
     chosen: List[int] = []
     curr: MethodContext = no_cse
+    had_candidates = any(c.can_apply for c in curr.cse_candidates)
     while any(c.can_apply for c in curr.cse_candidates):
         try:
             # can_terminate=True unconditionally: the correct greedy answer
@@ -151,7 +152,16 @@ def _rollout(superpmi: SuperPmi, jitrl: JitCseModel, method_id: int,
                                                     if not math.isnan(rl2020_score) else float("nan"))
         curr = step
 
-    status = "ok" if chosen else "no_candidates"
+    # "no_candidates" now strictly means the method had no viable CSE
+    # candidates for the RL to consider (loop never entered). If the
+    # loop entered but the policy chose to stop immediately (chosen=[])
+    # that's still a valid rollout outcome ("stop is an action") and
+    # counts as "ok" -- rl_perfscore == no_cse.perf_score in that case.
+    # Previously this was miscategorized as "no_candidates" and hidden
+    # from the summary, which masked policies that over-committed to
+    # stop (e.g. D1_linear stopping on 98% of test methods with high
+    # regressions on B/C/D_dramatic buckets).
+    status = "ok" if had_candidates else "no_candidates"
     return RolloutRow(method_id=method_id, name=heuristic.name, method_hash=heuristic.hash,
                       num_candidates=len(no_cse.cse_candidates),
                       chosen_cses=chosen,
