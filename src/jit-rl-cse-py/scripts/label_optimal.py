@@ -241,10 +241,15 @@ def _resolve_indices(mch: str, core_root: str, indices_file: Optional[str],
 def _worker(mch: str, core_root: str, method_ids: List[int],
             exhaustive_cutoff: int, mcmc_trials: int, seed: int) -> Dict[str, Dict]:
     """One process-pool worker: label a slice of methods."""
+    import sys
     rng = random.Random(seed)
     out: Dict[str, Dict] = {}
     with SuperPmi(mch, core_root) as spmi:
         for method_id in method_ids:
+            # Log which method we're about to work on so, if we hang here,
+            # a status check reveals the exact trigger (worker-level log
+            # + os.getpid).
+            print(f"    [pid {os.getpid()}] method {method_id}", flush=True)
             label = _label_method(spmi, method_id, exhaustive_cutoff, mcmc_trials, rng)
             if label is not None:
                 out[str(method_id)] = label
