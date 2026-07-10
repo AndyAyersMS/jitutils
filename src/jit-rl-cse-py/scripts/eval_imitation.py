@@ -37,7 +37,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.train_imitation import ImitationScorer
+from scripts.train_imitation import ImitationScorer, _NORMALIZER
 from jitml.constants import MAX_CSE
 from jitml.jit_cse import JitCseEnv
 from jitml.superpmi import SuperPmi
@@ -87,8 +87,9 @@ def _method_pass(spmi: SuperPmi, model: ImitationScorer, method_id: int,
         return None
 
     obs = JitCseEnv.get_observation(no_cse)
-    cands = torch.from_numpy(obs["candidates"].astype(np.float32)).unsqueeze(0).to(device)
-    method = torch.from_numpy(obs["method"].astype(np.float32)).unsqueeze(0).to(device)
+    cands_norm, method_norm = _NORMALIZER.normalize(obs["candidates"], obs["method"])
+    cands = torch.from_numpy(cands_norm.astype(np.float32)).unsqueeze(0).to(device)
+    method = torch.from_numpy(method_norm.astype(np.float32)).unsqueeze(0).to(device)
     with torch.no_grad():
         logits = model(cands, method).squeeze(0)   # (MAX_CSE,)
         probs = torch.sigmoid(logits).cpu().numpy()

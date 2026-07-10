@@ -62,6 +62,58 @@ from jitml.superpmi import SuperPmi, SuperPmiCache
 import gymnasium as gym
 
 
+class _FeatureNormalizer:
+    """Standalone feature normalizer that mirrors NormalizeFeaturesWrapper
+    without needing a gym env. Applies the same per-column transforms:
+    log1p for COUNT columns, /1000 for LOG_X1000 and RATIO_X1000, /2 for
+    ENUM_SMALL, identity for BOOL and ONEHOT.
+    """
+
+    def __init__(self):
+        from jitml.jit_cse import (
+            PER_CANDIDATE_SCHEMA, METHOD_SCHEMA,
+            FEATURE_KIND_BOOL, FEATURE_KIND_ONEHOT,
+            FEATURE_KIND_COUNT, FEATURE_KIND_LOG_X1000,
+            FEATURE_KIND_RATIO_X1000, FEATURE_KIND_ENUM_SMALL,
+            _CODE_OPT_KIND_DIVISOR,
+        )
+
+        def masks(schema):
+            n = len(schema)
+            log1p_mask = np.zeros(n, dtype=bool)
+            scale = np.ones(n, dtype=np.float32)
+            for i, (_name, kind) in enumerate(schema):
+                if kind == FEATURE_KIND_COUNT:
+                    log1p_mask[i] = True
+                elif kind == FEATURE_KIND_LOG_X1000:
+                    scale[i] = 1000.0
+                elif kind == FEATURE_KIND_RATIO_X1000:
+                    scale[i] = 1000.0
+                elif kind == FEATURE_KIND_ENUM_SMALL:
+                    scale[i] = _CODE_OPT_KIND_DIVISOR
+                elif kind in (FEATURE_KIND_BOOL, FEATURE_KIND_ONEHOT):
+                    pass
+                else:
+                    raise ValueError(f"unknown feature kind {kind!r}")
+            return log1p_mask, scale
+
+        self._cand_log1p, self._cand_scale = masks(PER_CANDIDATE_SCHEMA)
+        self._method_log1p, self._method_scale = masks(METHOD_SCHEMA)
+
+    def normalize(self, cand: np.ndarray, method: np.ndarray
+                  ) -> "tuple[np.ndarray, np.ndarray]":
+        cand = cand.astype(np.float32).copy()
+        method = method.astype(np.float32).copy()
+        cand /= self._cand_scale
+        method /= self._method_scale
+        cand[:, self._cand_log1p] = np.log1p(np.maximum(cand[:, self._cand_log1p], 0.0))
+        method[self._method_log1p] = np.log1p(np.maximum(method[self._method_log1p], 0.0))
+        return cand, method
+
+
+_NORMALIZER = _FeatureNormalizer()
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--core_root", required=True)
@@ -114,10 +166,14 @@ class Sample:
 
 
 def _build_sample(m, optimal_subset: List[int]) -> Sample:
-    """Encode a MethodContext + its optimal_subset labels into a Sample."""
+    """Encode a MethodContext + its optimal_subset labels into a Sample.
+
+    Features are normalized identically to NormalizeFeaturesWrapper so
+    the trained model can also run on RL-trained env observations
+    without re-normalization.
+    """
     obs = JitCseEnv.get_observation(m)  # dict with 'candidates' + 'method'
-    cands = obs["candidates"]
-    method = obs["method"]
+    cands, method = _NORMALIZER.normalize(obs["candidates"], obs["method"])
 
     # Only the first ``min(len(m.cse_candidates), MAX_CSE)`` rows are real.
     n_slots = min(len(m.cse_candidates), MAX_CSE)
