@@ -117,10 +117,15 @@ _NORMALIZER = _FeatureNormalizer()
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--core_root", required=True)
-    p.add_argument("--mch", required=True,
-                   help="MCH containing the methods labeled by --labels.")
-    p.add_argument("--labels", required=True,
-                   help="JSON produced by scripts/label_optimal.py.")
+    p.add_argument("--mch", action="append", default=[],
+                   help="MCH containing labeled methods. Repeat this flag "
+                        "together with a matching --labels flag to train on "
+                        "labels sourced from multiple MCHes. Order matters: "
+                        "the i-th --mch pairs with the i-th --labels.")
+    p.add_argument("--labels", action="append", default=[],
+                   help="JSON produced by scripts/label_optimal.py. See "
+                        "--mch for pairing rules when multiple sources are "
+                        "supplied.")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--iterations", type=int, default=20,
                    help="Training epochs (default 20).")
@@ -135,7 +140,7 @@ def _parse_args() -> argparse.Namespace:
                         "overfit on the labeled pool.")
     p.add_argument("--pos-weight-cap", type=float, default=10.0,
                    help="Cap on per-batch positive-class up-weighting in BCE loss "
-                        "(default 10.0). About 20-30% of viable candidates are in "
+                        "(default 10.0). About 20-30 pct of viable candidates are in "
                         "the optimal subset on labeled sample, so pos-weight ~ 3-5 "
                         "at baseline. Cap prevents runaway on rare buckets.")
     p.add_argument("--val-fraction", type=float, default=0.1,
@@ -197,17 +202,37 @@ class LabeledMethodDataset(Dataset):
 
     Features are fetched at __init__ (batch JIT calls up-front) and
     cached in memory. Labels come from the JSON file.
+
+    Supports MULTIPLE MCH+labels sources. Method indices are namespaced
+    per-MCH (method 100 in aspnet2 is a different method than method
+    100 in train_big), so features are loaded from each MCH with its
+    matching labels JSON. Training samples are pooled after loading.
     """
 
-    def __init__(self, mch: str, core_root: str, labels_path: str,
-                 include_ids: Optional[set] = None):
+    def __init__(self, sources: List["tuple[str, str]"], core_root: str,
+                 include_ids_per_source: Optional[List[set]] = None):
+        """
+        Args:
+            sources: List of (mch_path, labels_path) tuples.
+            core_root: SPMI Core_Root path.
+            include_ids_per_source: Optional per-source id filter.
+        """
+        self.samples: List[Sample] = []
+        for si, (mch, labels_path) in enumerate(sources):
+            include_ids = None
+            if include_ids_per_source is not None:
+                include_ids = include_ids_per_source[si]
+            self._load_source(mch, core_root, labels_path, include_ids)
+
+    def _load_source(self, mch: str, core_root: str, labels_path: str,
+                     include_ids: Optional[set]) -> None:
         with open(labels_path, encoding="utf-8") as f:
             all_labels = json.load(f)
 
         if include_ids is not None:
             all_labels = {k: v for k, v in all_labels.items() if int(k) in include_ids}
 
-        self.samples: List[Sample] = []
+        before = len(self.samples)
         print(f"Loading features for {len(all_labels)} methods from {mch}...")
         t0 = time.time()
         with SuperPmi(mch, core_root) as spmi:
@@ -222,9 +247,10 @@ class LabeledMethodDataset(Dataset):
                 if m is None:
                     continue
                 self.samples.append(_build_sample(m, label["optimal_subset"]))
-                if (i + 1) % 100 == 0:
+                if (i + 1) % 200 == 0:
                     print(f"  {i+1}/{len(all_labels)}  ({time.time()-t0:.0f}s)")
-        print(f"  loaded {len(self.samples)} samples in {time.time()-t0:.0f}s")
+        added = len(self.samples) - before
+        print(f"  loaded {added} samples in {time.time()-t0:.0f}s")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -354,14 +380,26 @@ def main() -> int:
     args = _parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    if len(args.mch) == 0 or len(args.labels) == 0:
+        print("FAIL: at least one --mch and one --labels must be provided.", file=sys.stderr)
+        return 2
+    if len(args.mch) != len(args.labels):
+        print(f"FAIL: --mch count ({len(args.mch)}) != --labels count "
+              f"({len(args.labels)}); they pair positionally.", file=sys.stderr)
+        return 2
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    print(f"Training sources ({len(args.mch)}):")
+    for m, l in zip(args.mch, args.labels):
+        print(f"  {os.path.basename(m)} <- {os.path.basename(l)}")
 
-    # 1. Load labels + features.
-    dataset = LabeledMethodDataset(args.mch, args.core_root, args.labels)
+    # 1. Load labels + features across all sources.
+    sources = list(zip(args.mch, args.labels))
+    dataset = LabeledMethodDataset(sources, args.core_root)
     if len(dataset) < 20:
         print(f"FAIL: only {len(dataset)} samples usable; need >= 20.", file=sys.stderr)
         return 2
@@ -423,7 +461,8 @@ def main() -> int:
         "n_train": len(train_idx),
         "n_val": len(val_idx),
         "n_params": n_params,
-        "labels_file": args.labels,
+        "labels_files": args.labels,
+        "mch_files": args.mch,
     }
     with open(os.path.join(args.output_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
