@@ -4,9 +4,13 @@ from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 import json
 import os
+import queue
 import subprocess
 import re
+import sys
 import tempfile
+import threading
+import time
 from typing import Dict, Iterable, List
 from pydantic import BaseModel, field_validator
 import tqdm
@@ -79,12 +83,43 @@ class SuperPmiContext(BaseModel):
         return SuperPmiCache(self.mch, self.core_root)
 
 class SuperPmi:
-    """Controls one instance of superpmi."""
+    """Controls one instance of superpmi.
+
+    Includes several client-side safeguards against JIT/SPMI crashes and
+    hangs (which are rare but do happen -- e.g. streaming mode is not
+    fully robust when JitRLHook + JitCSEMask combinations are used on
+    specific methods):
+
+    * **Per-request timeout** via a background reader thread: each
+      ``jit_method`` call waits at most ``REQUEST_TIMEOUT`` seconds
+      for the JIT to respond. If the deadline passes we kill spmi,
+      restart, and return None -- turning hangs into recoverable
+      failures the caller can skip past.
+    * **EOF detection**: an empty read (superpmi crashed without a
+      done sentinel) is treated as failure and triggers restart.
+    * **Consecutive-restart cap**: if the same call fails
+      ``MAX_CONSECUTIVE_RESTARTS`` times in a row we give up on it and
+      return None (rather than looping forever restarting spmi).
+    * **Clean stop()**: explicit stdin close before terminate() to
+      prevent Python's GC from raising OSError on the buffered writer
+      when the pipe is broken.
+    """
+
+    # Per-request wall-clock timeout (seconds). Chosen generous enough
+    # for the widest MCMC-labeling calls (~500 JIT compiles worth of
+    # cumulative superpmi work) but tight enough to catch true hangs.
+    REQUEST_TIMEOUT = 60.0
+    # If a single method fails to complete this many attempts in a row
+    # (each attempt spawns a fresh spmi), give up on it entirely.
+    MAX_CONSECUTIVE_RESTARTS = 3
+
     def __init__(self, mch : str, core_root : str):
         """Constructor.
         core_root is the path to the coreclr build, usually at [repo]/artifiacts/bin/coreclr/[arch]/.
         verbosity is the verbosity level of the superpmi process. Default is 'q'."""
         self._process = None
+        self._stdout_queue: "queue.Queue | None" = None
+        self._stdout_thread: "threading.Thread | None" = None
         self._feature_names = None
         self._method_feature_names = None
         self.mch = mch
@@ -121,23 +156,46 @@ class SuperPmi:
     def __exit__(self, *_):
         self.stop()
 
-    def jit_method(self, method_or_id : int | MethodContext, retry=1, **options) -> MethodContext:
-        """Attempts to jit the method, and retries if it fails up to "retry" times."""
+    def jit_method(self, method_or_id : int | MethodContext, retry=1,
+                    timeout=None, **options) -> MethodContext:
+        """Attempts to jit the method, and retries if it fails up to "retry" times.
+
+        ``timeout`` (seconds) overrides :attr:`REQUEST_TIMEOUT` for this
+        call. On timeout the caller sees ``None`` and the underlying
+        superpmi process is killed and restarted so the next call gets
+        a fresh interpreter.
+
+        Consecutive failures on the *same call* are capped at
+        :attr:`MAX_CONSECUTIVE_RESTARTS` even if the caller sets a very
+        high ``retry`` -- this prevents an infinite restart storm when
+        a specific method reliably crashes the JIT.
+        """
         if retry < 1:
             raise ValueError("retry must be greater than 0.")
 
-        for _ in range(retry):
-            result = self.__jit_method(method_or_id, **options)
+        capped_retry = min(retry, self.MAX_CONSECUTIVE_RESTARTS)
+        for attempt in range(capped_retry):
+            result = self.__jit_method(method_or_id, timeout=timeout, **options)
             if result is not None:
                 return result
-
-            self.stop()
+            # __jit_method already killed the process on failure.
+            # Cold-restart a fresh spmi before the next attempt.
+            self._safe_stop()
             self.start()
 
         return None
 
-    def __jit_method(self, method_or_id : int | MethodContext, **options) -> MethodContext:
-        """Jits the method given by id or MethodContext."""
+    def __jit_method(self, method_or_id : int | MethodContext,
+                     timeout=None, **options) -> MethodContext:
+        """Jits the method given by id or MethodContext.
+
+        Returns None if the call times out, hits EOF, or the process
+        crashes -- these are recoverable failures. The caller
+        (:meth:`jit_method`) will restart spmi and retry.
+        """
+        if timeout is None:
+            timeout = self.REQUEST_TIMEOUT
+
         process = self._process
         if process is None:
             raise ValueError("SuperPmi process is not running.  Use a 'with' statement.")
@@ -154,32 +212,53 @@ class SuperPmi:
         torun = f"{method_or_id}!"
         torun += "!".join(self.__translate_options(options))
 
-        # Only restart superpmi if it has actually terminated. The previous
-        # ``if not process.poll()`` was inverted -- ``process.poll()``
-        # returns None while running, and ``not None`` is truthy, so the
-        # restart fired on every jit_method call. That was masked when we
-        # scanned small MCH files (fast startup) but tanked performance on
-        # 7.5GB combined.tier1.mch (500ms+ per restart). Fixing this makes
-        # streaming replay 5-10x faster since we now amortize one superpmi
-        # startup across all methods in a session.
+        # If a prior request already killed the process, restart before
+        # this attempt. process.poll() returns None while running, a
+        # returncode when terminated.
         if process.poll() is not None:
-            self.stop()
+            self._safe_stop()
             process = self.start()
 
-        process.stdin.write(f"{torun}\n".encode('utf-8'))
-        process.stdin.flush()
+        try:
+            process.stdin.write(f"{torun}\n".encode('utf-8'))
+            process.stdin.flush()
+        except (OSError, ValueError):
+            # Pipe broken -- spmi died. Return None so caller can
+            # restart and retry.
+            self._safe_stop()
+            return None
 
         result = None
         output = ""
 
+        # Read stdout via the background reader thread's queue, with
+        # a deadline. If the deadline expires we treat it as a hang
+        # and kill spmi.
+        deadline = time.monotonic() + timeout
         while not output.startswith('[streaming] Done.'):
-            line = process.stdout.readline()
-            # An empty read means EOF -- superpmi has closed stdout, either
-            # because it exited normally (unusual mid-request) or crashed.
-            # Return None so the caller's retry loop can restart the process
-            # and skip past the problematic method. Without this guard the
-            # loop hangs forever waiting for output that will never arrive.
-            if not line:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # Hang: kill the process. Caller will restart.
+                print(f"jit_method timeout after {timeout:.1f}s "
+                      f"(method={method_or_id}) -- killing spmi",
+                      file=sys.stderr)
+                self._safe_stop()
+                return None
+            q = self._stdout_queue
+            if q is None:
+                # start() wasn't called or stop() ran during another
+                # thread -- shouldn't happen, but be defensive.
+                return None
+            try:
+                line = q.get(timeout=remaining)
+            except queue.Empty:
+                # Should have hit the deadline check first; treat as
+                # timeout defensively.
+                self._safe_stop()
+                return None
+            if line is None:
+                # EOF sentinel from reader thread -- spmi closed stdout.
+                # Treat as failure so caller can restart.
                 return None
             output = line.decode('utf-8').strip()
             if output.startswith(';'):
@@ -187,6 +266,13 @@ class SuperPmi:
 
         assert result is None or result.index == method_or_id
         return result
+
+    def _safe_stop(self) -> None:
+        """Terminate the current process without raising. Idempotent."""
+        try:
+            self.stop()
+        except Exception:  # noqa: BLE001
+            pass
 
     def __translate_options(self, options:Dict[str,object]) -> List[str]:
         result = []
@@ -368,28 +454,98 @@ class SuperPmi:
         if self._process is None:
             # pylint: disable=consider-using-with
             params = [self.superpmi_path, self.jit_path, '-streaming', 'stdin', self.mch, '-v', 'q']
-            self._process = subprocess.Popen(params, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            self._process = subprocess.Popen(
+                params, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            )
+            # Background reader thread pipes stdout lines into a queue
+            # so jit_method can read with a timeout (Windows lacks
+            # ``select`` on pipes, so this is the portable way to
+            # implement per-request deadlines).
+            self._stdout_queue = queue.Queue()
+            self._stdout_thread = threading.Thread(
+                target=self._reader_loop,
+                args=(self._process.stdout, self._stdout_queue),
+                daemon=True,
+            )
+            self._stdout_thread.start()
 
         return self._process
 
+    @staticmethod
+    def _reader_loop(pipe, out_queue: "queue.Queue") -> None:
+        """Read raw bytes-lines from ``pipe`` and put them on ``out_queue``.
+
+        Puts ``None`` on the queue when the pipe closes (EOF) so
+        consumers can distinguish "waiting" from "no more data".
+        """
+        try:
+            for line in iter(pipe.readline, b''):
+                out_queue.put(line)
+        except (OSError, ValueError):
+            # Pipe closed / process gone. Fall through to sentinel.
+            pass
+        out_queue.put(None)
+
     def stop(self):
-        """Closes the superpmi process."""
-        if self._process is not None:
-            proc, self._process = self._process, None
-            # Best-effort: write a quit request if the pipe is still open.
-            # If the process already exited or stdin was closed we get an
-            # OSError which we deliberately swallow (this is called from
-            # __del__ during interpreter shutdown).
-            try:
-                if proc.stdin is not None and not proc.stdin.closed:
+        """Closes the superpmi process. Idempotent and non-raising.
+
+        Called both proactively (context manager exit) and reactively
+        (after a timeout or crash). Ordering matters:
+
+        1. Detach ``self._process`` immediately so concurrent callers
+           see no live process.
+        2. Close stdin first so the subprocess sees EOF and can exit
+           cleanly. We do this BEFORE ``terminate()`` so Python's GC
+           later doesn't try to flush a broken pipe.
+        3. Terminate + wait a couple seconds, then kill if needed.
+        4. Drain the reader thread by pushing an EOF sentinel.
+        """
+        if self._process is None:
+            return
+        proc, self._process = self._process, None
+        self._stdout_queue = None
+        self._stdout_thread = None  # daemon thread exits when pipe closes
+
+        # 1. Best-effort quit request.
+        try:
+            if proc.stdin is not None and not proc.stdin.closed:
+                try:
                     proc.stdin.write(b"quit\n")
                     proc.stdin.flush()
-            except (OSError, ValueError):
-                pass
+                except (OSError, ValueError):
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 2. Explicit stdin close so Python's GC doesn't later try to
+        # flush a broken pipe (which raises OSError [Errno 22]
+        # asynchronously and pollutes stderr).
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except (OSError, ValueError):
+            pass
+
+        # 3. Terminate, waiting up to 2 sec; kill if unresponsive.
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
             try:
-                proc.terminate()
-            except OSError:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:  # noqa: BLE001
                 pass
+        except Exception:  # noqa: BLE001
+            pass
 
 class MethodKind(Enum):
     """The kind of method perf-score to compare against.
