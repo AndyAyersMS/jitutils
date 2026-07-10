@@ -262,7 +262,19 @@ class SuperPmi:
                 return None
             output = line.decode('utf-8').strip()
             if output.startswith(';'):
-                result = self._parse_method_context(output)
+                try:
+                    result = self._parse_method_context(output)
+                except (ValueError, KeyError, IndexError) as exc:
+                    # Malformed output from spmi (known streaming bug on
+                    # certain methods -- see prior investigation notes).
+                    # Don't leave spmi in a corrupted state where the
+                    # next call would read stale/garbled data. Kill it
+                    # and let the caller restart.
+                    print(f"jit_method parse failure "
+                          f"(method={method_or_id}): {type(exc).__name__}: {exc}",
+                          file=sys.stderr)
+                    self._safe_stop()
+                    return None
 
         assert result is None or result.index == method_or_id
         return result
