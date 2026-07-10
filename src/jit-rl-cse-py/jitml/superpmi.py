@@ -6,12 +6,49 @@ import json
 import os
 import subprocess
 import re
+import tempfile
 from typing import Dict, Iterable, List
 from pydantic import BaseModel, field_validator
 import tqdm
 
 from .constants import split_for_cse
 from .method_context import MethodContext
+
+
+def _atomic_write_json(path: str, obj) -> None:
+    """Write JSON atomically: write to a tempfile in the same directory,
+    then ``os.replace`` onto ``path``. ``os.replace`` is atomic on both
+    POSIX and Windows (when source and destination are on the same
+    filesystem), so concurrent readers never observe a partial file.
+
+    Multiple concurrent writers may still race on the final rename; on
+    Windows ``os.replace`` can transiently raise ``PermissionError``
+    if the destination is momentarily held by another process. We
+    retry a few times with a short backoff; if all attempts fail we
+    swallow the error (the caller's next call to
+    :func:`os.path.exists` will still succeed because a rival writer
+    has already produced a complete file).
+    """
+    import time
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=directory)
+    wrote_ok = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf8") as f:
+            json.dump(obj, f)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                wrote_ok = True
+                break
+            except PermissionError:
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        if not wrote_ok:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 # We cannot pass a SuperPmi class across process boundaries.  So we need to create a context object that can be
 # serialized and deserialized.
@@ -415,8 +452,7 @@ class SuperPmiCache:
         test, train = split_for_cse(self.no_cse.values(), test_percent=0.1)
         test = [x.index for x in test]
         train = [x.index for x in train]
-        with open(split_file, 'w', encoding="utf8") as f:
-            json.dump([test, train], f)
+        _atomic_write_json(split_file, [test, train])
 
         return test, train
 
@@ -523,8 +559,7 @@ class SuperPmiCache:
             progress.update(len(method.cse_candidates))
 
         progress.close()
-        with open(filename, 'w', encoding="utf8") as f:
-            json.dump(result, f)
+        _atomic_write_json(filename, result)
 
         return result
 
@@ -576,13 +611,12 @@ class SuperPmiCache:
             for method in spmi.enumerate_methods(**jit_flags):
                 result[method.index] = method
 
-        with open(filename, 'w', encoding="utf8") as f:
-            # Emit using aliases so the on-disk JSON schema matches the
-            # JIT-emitted feature names (``use_wt_cnt``, ``def_wt_cnt``)
-            # rather than the internal ``_legacy`` suffixed field names.
-            # Old jitml v1 cache files use the alias names and are still
-            # loaded via pydantic's ``populate_by_name=True``.
-            json.dump([m.model_dump(by_alias=True) for m in result.values()], f)
+        # Emit using aliases so the on-disk JSON schema matches the
+        # JIT-emitted feature names (``use_wt_cnt``, ``def_wt_cnt``)
+        # rather than the internal ``_legacy`` suffixed field names.
+        # Old jitml v1 cache files use the alias names and are still
+        # loaded via pydantic's ``populate_by_name=True``.
+        _atomic_write_json(filename, [m.model_dump(by_alias=True) for m in result.values()])
 
         return result
 
