@@ -186,6 +186,12 @@ class MethodContext(BaseModel):
     # 9-slot maxMethodFeatures bump.
     has_pgo_weights          : bool = False
     has_pgo_dynamic          : bool = False
+    # ISA one-hot emitted by CSE_HeuristicRLHook. Both False means the
+    # target is neither x64 nor arm64 (e.g. arm32, wasm, loongarch, riscv).
+    # Default False for backwards-compat with cached JSON produced before
+    # the 11-slot maxMethodFeatures bump.
+    is_x64                   : bool = False
+    is_arm64                 : bool = False
 
     def __str__(self):
         return f"{self.index}: {self.name}"

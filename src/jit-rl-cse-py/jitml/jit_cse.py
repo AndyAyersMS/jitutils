@@ -94,6 +94,11 @@ METHOD_SCHEMA = [
     # the JitRLHookEmitEarly + PGO-signal patch.
     ("has_pgo_weights",           FEATURE_KIND_BOOL),
     ("has_pgo_dynamic",           FEATURE_KIND_BOOL),
+    # ISA one-hot. Two booleans emitted by the JIT: is_x64, is_arm64.
+    # Both zero for other targets (arm32, wasm, loongarch64, riscv64).
+    # Default to 0 in cached JSON that predates the ISA-onehot patch.
+    ("is_x64",                    FEATURE_KIND_BOOL),
+    ("is_arm64",                  FEATURE_KIND_BOOL),
 ]
 
 FEATURES_PER_CANDIDATE = len(PER_CANDIDATE_SCHEMA)   # 30
@@ -401,6 +406,8 @@ class JitCseEnv(gym.Env):
             method.spill_at_weight_x1000,
             float(method.has_pgo_weights),
             float(method.has_pgo_dynamic),
+            float(method.is_x64),
+            float(method.is_arm64),
         ], dtype=np.float32)
 
         return {"candidates": candidates, "method": method_arr}
