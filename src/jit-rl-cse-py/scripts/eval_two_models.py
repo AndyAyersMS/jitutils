@@ -48,6 +48,7 @@ def _apply(spmi: SuperPmi, model: ImitationScorer, method_id: int,
     try:
         no_cse = spmi.jit_method(method_id, JitMetrics=1, JitRLHook=1,
                                  JitRLHookEmitFeatureNames=1,
+                                 JitRLHookEmitEarly=1,
                                  JitRLHookCSEDecisions=[])
     except Exception:
         return None

@@ -25,7 +25,9 @@ def main():
 
     with SuperPmi(args.mch, args.core_root) as spmi:
         m = spmi.jit_method(args.method, JitMetrics=1, JitRLHook=1,
-                            JitRLHookEmitFeatureNames=1, JitRLHookCSEDecisions=[])
+                            JitRLHookEmitFeatureNames=1,
+                            JitRLHookEmitEarly=1,
+                            JitRLHookCSEDecisions=[])
     if m is None:
         print("failed to jit method"); return 1
 

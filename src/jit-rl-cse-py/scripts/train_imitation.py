@@ -253,6 +253,7 @@ class LabeledMethodDataset(Dataset):
                 try:
                     m = spmi.jit_method(mid, JitMetrics=1, JitRLHook=1,
                                         JitRLHookEmitFeatureNames=1,
+                                        JitRLHookEmitEarly=1,
                                         JitRLHookCSEDecisions=[])
                 except Exception:
                     continue
