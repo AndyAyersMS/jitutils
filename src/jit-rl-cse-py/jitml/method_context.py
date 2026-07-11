@@ -181,6 +181,11 @@ class MethodContext(BaseModel):
     code_opt_kind            : int  = 0
     add_cse_count            : int  = 0
     spill_at_weight_x1000    : int  = 0
+    # PGO availability signals emitted by CSE_HeuristicRLHook. Both default
+    # to False for backwards-compat with cached JSON produced before the
+    # 9-slot maxMethodFeatures bump.
+    has_pgo_weights          : bool = False
+    has_pgo_dynamic          : bool = False
 
     def __str__(self):
         return f"{self.index}: {self.name}"

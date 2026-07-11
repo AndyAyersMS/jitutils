@@ -70,7 +70,9 @@ PER_CANDIDATE_SCHEMA = [
 
 # Method-level columns. bb_count and the per-class enreg counts are the
 # original 5; the trailing five are Tier-1 additions; the last two are
-# the sequence-aware additions (add_cse_count, spill_at_weight_x1000).
+# the sequence-aware additions (add_cse_count, spill_at_weight_x1000);
+# the FINAL two are PGO availability signals so a unified model trained
+# on mixed PGO / non-PGO methods can condition on weight-source.
 METHOD_SCHEMA = [
     ("bb_count",                  FEATURE_KIND_COUNT),
     ("enreg_count_int",           FEATURE_KIND_COUNT),
@@ -87,6 +89,11 @@ METHOD_SCHEMA = [
     # already log-scaled x1000 fixed-point.
     ("add_cse_count",             FEATURE_KIND_COUNT),
     ("spill_at_weight_x1000",     FEATURE_KIND_LOG_X1000),
+    # PGO availability signals. Both booleans emitted by the JIT for
+    # every method. Default to 0 in older cached JSON that predates
+    # the JitRLHookEmitEarly + PGO-signal patch.
+    ("has_pgo_weights",           FEATURE_KIND_BOOL),
+    ("has_pgo_dynamic",           FEATURE_KIND_BOOL),
 ]
 
 FEATURES_PER_CANDIDATE = len(PER_CANDIDATE_SCHEMA)   # 30
@@ -392,6 +399,8 @@ class JitCseEnv(gym.Env):
             method.code_opt_kind,
             method.add_cse_count,
             method.spill_at_weight_x1000,
+            float(method.has_pgo_weights),
+            float(method.has_pgo_dynamic),
         ], dtype=np.float32)
 
         return {"candidates": candidates, "method": method_arr}

@@ -276,10 +276,10 @@ def test_get_observation_produces_dict_with_correct_shapes():
     # Method-level features: [bb_count, enreg_int, enreg_flt, enreg_simd,
     # enreg_msk, aggressive_ref_cnt_x1000, moderate_ref_cnt_x1000,
     # large_frame, huge_frame, code_opt_kind, add_cse_count,
-    # spill_at_weight_x1000].
+    # spill_at_weight_x1000, has_pgo_weights, has_pgo_dynamic].
     np.testing.assert_array_equal(
         obs["method"],
-        np.array([42, 7, 3, 1, 0, 50000, 100000, 0, 0, 0, 0, 0], dtype=np.float32),
+        np.array([42, 7, 3, 1, 0, 50000, 100000, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32),
     )
 
 
