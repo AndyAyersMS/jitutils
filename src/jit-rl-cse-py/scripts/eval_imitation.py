@@ -61,6 +61,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Optionally cap the number of methods evaluated.")
     p.add_argument("--include-rl2020", action="store_true",
                    help="Also collect JitRLCSEGreedy baseline scores.")
+    p.add_argument("--jit-path", default=None,
+                   help="Optional override for the JIT dll (e.g. clrjit_universal_arm64_x64.dll "
+                        "for cross-jitting arm64 collections on an x64 host).")
     p.add_argument("--out-csv", type=str, default=None,
                    help="Optional: write per-method results here.")
     return p.parse_args()
@@ -215,7 +218,7 @@ def main() -> int:
 
     rows: List[Dict] = []
     t0 = time.time()
-    with SuperPmi(args.mch, args.core_root) as spmi:
+    with SuperPmi(args.mch, args.core_root, jit_path=args.jit_path) as spmi:
         idx = 1
         while True:
             if args.limit is not None and len(rows) >= args.limit:

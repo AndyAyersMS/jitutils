@@ -143,6 +143,10 @@ def _parse_args() -> argparse.Namespace:
                         "(default 10.0). About 20-30 pct of viable candidates are in "
                         "the optimal subset on labeled sample, so pos-weight ~ 3-5 "
                         "at baseline. Cap prevents runaway on rare buckets.")
+    p.add_argument("--jit-path", action="append", default=[],
+                   help="Optional per-source JIT dll override. Use once per --mch "
+                        "when supplied; e.g. --jit-path <clrjit.dll> --jit-path "
+                        "<clrjit_universal_arm64_x64.dll>. Applied positionally.")
     p.add_argument("--val-fraction", type=float, default=0.1,
                    help="Fraction of labels held out for validation (default 0.1).")
     p.add_argument("--seed", type=int, default=42)
@@ -210,22 +214,30 @@ class LabeledMethodDataset(Dataset):
     """
 
     def __init__(self, sources: List["tuple[str, str]"], core_root: str,
-                 include_ids_per_source: Optional[List[set]] = None):
+                 include_ids_per_source: Optional[List[set]] = None,
+                 jit_paths_per_source: Optional[List[Optional[str]]] = None):
         """
         Args:
             sources: List of (mch_path, labels_path) tuples.
             core_root: SPMI Core_Root path.
             include_ids_per_source: Optional per-source id filter.
+            jit_paths_per_source: Optional per-source override for the JIT dll
+                (e.g. clrjit_universal_arm64_x64.dll for arm64 cross-jit).
+                Same length as ``sources`` when provided.
         """
         self.samples: List[Sample] = []
         for si, (mch, labels_path) in enumerate(sources):
             include_ids = None
             if include_ids_per_source is not None:
                 include_ids = include_ids_per_source[si]
-            self._load_source(mch, core_root, labels_path, include_ids)
+            jit_path = None
+            if jit_paths_per_source is not None:
+                jit_path = jit_paths_per_source[si]
+            self._load_source(mch, core_root, labels_path, include_ids, jit_path)
 
     def _load_source(self, mch: str, core_root: str, labels_path: str,
-                     include_ids: Optional[set]) -> None:
+                     include_ids: Optional[set],
+                     jit_path: Optional[str] = None) -> None:
         with open(labels_path, encoding="utf-8") as f:
             all_labels = json.load(f)
 
@@ -235,7 +247,7 @@ class LabeledMethodDataset(Dataset):
         before = len(self.samples)
         print(f"Loading features for {len(all_labels)} methods from {mch}...")
         t0 = time.time()
-        with SuperPmi(mch, core_root) as spmi:
+        with SuperPmi(mch, core_root, jit_path=jit_path) as spmi:
             for i, (mid_str, label) in enumerate(all_labels.items()):
                 mid = int(mid_str)
                 try:
@@ -399,7 +411,16 @@ def main() -> int:
 
     # 1. Load labels + features across all sources.
     sources = list(zip(args.mch, args.labels))
-    dataset = LabeledMethodDataset(sources, args.core_root)
+    jit_paths = None
+    if args.jit_path:
+        if len(args.jit_path) != len(sources):
+            print(f"FAIL: --jit-path count ({len(args.jit_path)}) != source count "
+                  f"({len(sources)}).", file=sys.stderr)
+            return 2
+        jit_paths = [jp if jp and jp.lower() != "none" else None
+                     for jp in args.jit_path]
+    dataset = LabeledMethodDataset(sources, args.core_root,
+                                   jit_paths_per_source=jit_paths)
     if len(dataset) < 20:
         print(f"FAIL: only {len(dataset)} samples usable; need >= 20.", file=sys.stderr)
         return 2

@@ -113,9 +113,11 @@ class SuperPmi:
     # (each attempt spawns a fresh spmi), give up on it entirely.
     MAX_CONSECUTIVE_RESTARTS = 3
 
-    def __init__(self, mch : str, core_root : str):
+    def __init__(self, mch : str, core_root : str, jit_path : str | None = None):
         """Constructor.
         core_root is the path to the coreclr build, usually at [repo]/artifiacts/bin/coreclr/[arch]/.
+        jit_path, if provided, overrides the default clrjit.dll/libclrjit.so from core_root.
+        Use this to point at a cross-JIT (e.g. clrjit_universal_arm64_x64.dll).
         verbosity is the verbosity level of the superpmi process. Default is 'q'."""
         self._process = None
         self._stdout_queue: "queue.Queue | None" = None
@@ -127,10 +129,11 @@ class SuperPmi:
 
         if os.name == 'nt':
             self.superpmi_path = os.path.join(core_root, 'superpmi.exe')
-            self.jit_path = os.path.join(core_root, 'clrjit.dll')
+            default_jit = os.path.join(core_root, 'clrjit.dll')
         else:
             self.superpmi_path = os.path.join(core_root, 'superpmi')
-            self.jit_path = os.path.join(core_root, 'libclrjit.so')
+            default_jit = os.path.join(core_root, 'libclrjit.so')
+        self.jit_path = jit_path if jit_path is not None else default_jit
 
         if not os.path.exists(self.mch):
             raise FileNotFoundError(f"mch {self.mch} does not exist.")

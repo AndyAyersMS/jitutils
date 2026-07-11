@@ -102,6 +102,10 @@ def _parse_args() -> argparse.Namespace:
                    help="Random seed for MCMC trial subset generation (default 42).")
     p.add_argument("--resume", action="store_true",
                    help="If --out already exists, load it and skip methods already labeled.")
+    p.add_argument("--jit-path", default=None,
+                   help="Path to override the JIT dll (e.g. clrjit_universal_arm64_x64.dll "
+                        "for cross-jitting arm64 collections on an x64 host). "
+                        "Defaults to clrjit.dll/libclrjit.so from --core_root.")
     p.add_argument("--bbinstr-sample-rate", type=float, default=1.0,
                    help="Down-sample rate for methods compiled as 'Instrumented Tier1' "
                         "(BBINSTR flag). These methods are still tier1 PGO-optimized but "
@@ -265,7 +269,7 @@ def _label_method(spmi: SuperPmi, method_id: int, exhaustive_cutoff: int,
 
 def _resolve_indices(mch: str, core_root: str, indices_file: Optional[str],
                      scan_limit: Optional[int], limit: Optional[int],
-                     already_done: Set[int]) -> List[int]:
+                     already_done: Set[int], jit_path: Optional[str] = None) -> List[int]:
     """Determine which method ids to label."""
     ids: List[int] = []
     if indices_file:
@@ -276,7 +280,7 @@ def _resolve_indices(mch: str, core_root: str, indices_file: Optional[str],
         # SPMI instance; caller-supplied ``scan_limit`` bounds the walk.
         # Also stop after N CONSECUTIVE invalid indices, since indices
         # past the MCH's end will each trigger a costly spmi restart.
-        with SuperPmi(mch, core_root) as spmi:
+        with SuperPmi(mch, core_root, jit_path=jit_path) as spmi:
             top = scan_limit if scan_limit else 10_000_000
             consecutive_invalid = 0
             MAX_CONSECUTIVE_INVALID = 30
@@ -311,12 +315,13 @@ def _resolve_indices(mch: str, core_root: str, indices_file: Optional[str],
 
 def _worker(mch: str, core_root: str, method_ids: List[int],
             exhaustive_cutoff: int, mcmc_trials: int, seed: int,
-            bbinstr_sample_rate: float = 1.0) -> Dict[str, Dict]:
+            bbinstr_sample_rate: float = 1.0,
+            jit_path: Optional[str] = None) -> Dict[str, Dict]:
     """One process-pool worker: label a slice of methods."""
     import sys
     rng = random.Random(seed)
     out: Dict[str, Dict] = {}
-    with SuperPmi(mch, core_root) as spmi:
+    with SuperPmi(mch, core_root, jit_path=jit_path) as spmi:
         for method_id in method_ids:
             # Log which method we're about to work on so, if we hang here,
             # a status check reveals the exact trigger (worker-level log
@@ -342,7 +347,8 @@ def main() -> int:
 
     print(f"Resolving methods to label...")
     ids = _resolve_indices(args.mch, args.core_root, args.indices,
-                           args.scan_limit, args.limit, already_done)
+                           args.scan_limit, args.limit, already_done,
+                           jit_path=args.jit_path)
     print(f"  {len(ids)} methods to label "
           f"(exhaustive_cutoff={args.exhaustive_cutoff}, mcmc_trials={args.mcmc_trials})")
     if not ids:
@@ -368,7 +374,8 @@ def main() -> int:
             futures = [
                 pool.submit(_worker, args.mch, args.core_root, chunk,
                             args.exhaustive_cutoff, args.mcmc_trials,
-                            args.seed + ci, args.bbinstr_sample_rate)
+                            args.seed + ci, args.bbinstr_sample_rate,
+                            args.jit_path)
                 for ci, chunk in enumerate(chunks)
             ]
             for i, fut in enumerate(cf.as_completed(futures)):
@@ -380,7 +387,7 @@ def main() -> int:
                     _save_json(args.out, labels)
     else:
         rng = random.Random(args.seed)
-        with SuperPmi(args.mch, args.core_root) as spmi:
+        with SuperPmi(args.mch, args.core_root, jit_path=args.jit_path) as spmi:
             for i, method_id in enumerate(ids):
                 label = _label_method(spmi, method_id, args.exhaustive_cutoff,
                                       args.mcmc_trials, rng,
