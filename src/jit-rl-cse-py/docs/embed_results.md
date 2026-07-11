@@ -140,26 +140,42 @@ of DEBUG or duplicating it.
    available in Release builds requires either moving the feature
    emission code out of the DEBUG guard or splitting the class.
 
-2. **Threshold 0.30 is now suboptimal.** With early-emit features
-   the sweet spot moved to threshold 0.40. This is because
-   early-stage features have less magnitude for high-value counts,
-   so raw logits shift downward and the model wants a lower cutoff
-   to fire equivalently. Should update the training pipeline's
-   threshold-selection eval to reflect this.
+2. **Wall-clock validation** against dotnet/performance benchmarks
+   (per `docs/impacted_benchmarks.md`) requires either a Release-
+   build imitation heuristic or accepting Checked-build wall-clock
+   noise.
 
-3. **v7_early has slightly worse val_loss than v7-late** (0.287 vs
-   0.294 — but that's actually BETTER val_loss). On test.mch
-   restricted view, v7_early's Python-driven perf drops from
-   -0.384% to -0.277%. This is real: early-stage features carry
-   less signal per feature slot, so more capacity or more data may
-   help. Compensating with `bench_pgo` where late-stage drift was
-   catastrophic more than justifies the switch.
+## Threshold sweep (final, post-fix)
 
-4. **DEBUG-only means no Release perf validation yet.** Getting
-   real BenchmarkDotNet wall-clock numbers on the impacted
-   benchmarks (see `docs/impacted_benchmarks.md`) requires either
-   a Release-build imitation heuristic or accepting Checked-build
-   wall-clock noise.
+Corrected `JitCseImitationThreshold` from `CONFIG_INTEGER` (parsed
+as hex — footgun) to `CONFIG_STRING` (parses float directly).
+Also corrected `scripts/threshold_sweep_embedded.py` to pass
+string thresholds. Real curves are clean and unimodal — the
+originally-reported "threshold 0.30 pothole" was 100% harness
+noise from the hex-parsing bug.
+
+**x64 test.mch (750-method whole-set)**:
+| Threshold | b/s/w | arith | geo |
+|-----------|-------|------:|----:|
+| 0.15 | 174/513/61 | -0.062% | -0.080% |
+| 0.20 | 180/516/52 | -0.094% | -0.112% |
+| 0.25 | 181/516/51 | -0.099% | -0.116% |
+| 0.30 | 185/517/46 | -0.176% | -0.184% |
+| 0.35 | 187/513/46 | -0.186% | -0.193% |
+| 0.40 | 181/518/47 | **-0.189%** | **-0.197%** |
+
+**x64 bench_pgo.mch (5000-method whole-set)**:
+| Threshold | b/s/w | arith | geo |
+|-----------|-------|------:|----:|
+| 0.10 | 740/4108/143 | -0.249% | -0.267% |
+| 0.20 | 787/4091/112 | -0.267% | -0.286% |
+| 0.30 | 803/4085/99 | **-0.277%** | **-0.297%** |
+| 0.40 | 796/4060/125 | -0.253% | -0.275% |
+| 0.50 | 762/4060/159 | -0.213% | -0.236% |
+| 0.60 | 727/4006/241 | -0.076% | -0.108% |
+
+Suggested default threshold: **0.30** (best on bench_pgo, within
+0.02pp of the peak on test.mch).
 
 ## Next steps
 
@@ -174,13 +190,13 @@ of DEBUG or duplicating it.
    (v8 with PGO signal / ISA one-hot, arm64 specialist) is
    straightforward.
 
-3. **Investigate the threshold-0.30 pothole**. Both test.mch and
-   bench_pgo show t=0.30 significantly WORSE than t=0.25 and
-   t=0.40. Suggests either a per-candidate probability
-   distribution artifact of the early-emit training, or a
-   threshold-crossing pattern that repeats a small number of
-   over-applied candidates. Look at the per-candidate probs of
-   the ~700-800 method delta between the two thresholds.
+3. **Investigate the threshold-0.30 pothole** — RESOLVED. Was a
+   hex-parsing footgun (`CONFIG_INTEGER` reads decimal input as hex),
+   plus a matching bug in the sweep script. Fixed by moving
+   `JitCseImitationThreshold` to `CONFIG_STRING`. Corrected curves
+   are clean and unimodal, peaking at semantic 0.30 on bench_pgo
+   and semantic 0.40 on test.mch. See "Threshold sweep (final,
+   post-fix)" above.
 
 4. **Move the training-time feature normalization into the JIT.**
    The Python `_FeatureNormalizer` (log1p / /1000 / /2 / identity)
