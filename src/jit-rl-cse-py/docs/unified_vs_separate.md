@@ -18,6 +18,35 @@ fall back to separate models if measured per-axis performance
 against a unified model falls short by a material margin (≥ 0.1pp
 arith-mean pct-delta vs heuristic on the same test slice).
 
+**Concrete arm64 transfer data (2026-07-10 overnight, phase-3):**
+
+Compared v7-x64 (trained on 23,578 x64-only labels) against
+v8_arm64 (trained on 2,400 arm64-only labels) on a 600-method
+held-out arm64 test slice from
+`benchmarks.run_pgo.windows.arm64.checked.mch`:
+
+| Model | Training data | b/s/w vs heur | arith% | geo% |
+|-------|--------------|---------------|-------:|-----:|
+| v7 (x64), naive transfer | 23,578 x64 | 130/315/155 | **+1.527%** | +0.924% |
+| v8_arm64 (native) | 2,400 arm64 | 223/337/40 | **-0.805%** | -0.844% |
+
+Paired diff (v8-arm64 minus v7-x64):
+- v8-arm64 strictly better on 236/600 methods
+- ~same on 331/600
+- v7-x64 strictly better on 33/600
+
+**Interpretation**: Naive cross-ISA transfer without any ISA signal
+is a clear net negative: v7 makes many more losing decisions on
+arm64 than a small arm64-only model. This does NOT contradict the
+unified recommendation — it argues for the ISA one-hot feature. The
+model needs an explicit signal that this is arm64 code before it
+can specialize its predictions. Whether that signal is best carried
+via a shared model with an ISA feature (unified) or via separate
+per-ISA models (fully specialized) is what v9 (unified) needs to
+measure. The bar v9 must clear: match v8_arm64's -0.805% on the
+arm64 slice AND match v7-x64's -0.390% on the x64 slice, all with
+one model.
+
 ## Rationale
 
 ### 1. Feature encoding is trivial
@@ -120,12 +149,16 @@ learning benefits.
    correspondingly.
 2. Extend jitml's `METHOD_LEVEL_FEATURES` to 17.
 3. Label ~2000-3000 arm64 tier1+PGO methods (Phase 3 of this
-   overnight plan is the initial spike — expect a v8_arm64
-   standalone for comparison).
+   overnight plan delivered 3,000 arm64 labels from
+   `benchmarks.run_pgo.windows.arm64.checked.mch`; v8_arm64
+   trained on 2,400 of them hits -0.805% arith on 600-method
+   held-out slice).
 4. Train v9 unified on {x64_tier1_pgo + arm64_tier1_pgo +
    x64_non_pgo + arm64_non_pgo}, ~30k-40k total labels.
 5. Evaluate v9 on per-axis test slices; compare to per-axis
-   specialists.
+   specialists. **Success criterion**: v9-on-arm64-slice within
+   0.1pp of v8_arm64's -0.805% AND v9-on-x64-slice within
+   0.1pp of v7's -0.390%.
 
 ### Phase C: wasm (if/when required)
 
