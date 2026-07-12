@@ -161,3 +161,41 @@ perfscore-side trade-off.
 
 **Landed in commit `d72bdb97af4`**: JitCseImitationThreshold default
 changed from 0.30 to 0.40. Users can still override.
+
+## Threshold-0.50 sweep (v10, broader BDN, median-of-3)
+
+| Benchmark | t=0.30 | t=0.40 | **t=0.50** |
+|-----------|-------:|-------:|-----------:|
+| BenchAssignJagged | -0.48% | -2.53% | **-2.79%** |
+| MDLogicArray | +5.73% | -5.56% | **-5.75%** |
+| MDMulMatrix | -2.48% | -1.80% | **-2.07%** |
+| NDhrystone | +0.88% | -0.99% | **-1.24%** |
+| QuickSortSpan | +5.67% | +1.59% | -0.44% (noise) |
+| RayTracerBench | -4.23% | -1.70% | **-4.71%** |
+| benchFFT | +1.26% | -0.26% | -0.01% (noise) |
+| benchMonteCarlo | -0.86% | -1.19% | **-1.97%** |
+| **Arith mean** | +0.687% | -1.554% | **-2.372%** |
+| **wins/losses/same** | 3/4/1 | 6/1/1 | **6/0/2** |
+
+**Zero losses at t=0.50!** The default is now 0.50 (dotnet/runtime
+commit `6d5d4ee203c`). Perfscore trade-off is small (0.01-0.12pp
+worse than sweep peak on each of 4 axes) and wall-clock is what
+ultimately matters for deployment.
+
+### Threshold-vs-metric summary (v10, all sweeps)
+
+| Metric | t=0.30 | t=0.40 | t=0.50 |
+|--------|-------:|-------:|-------:|
+| test.mch perfscore | -0.239% | **-0.243%** | -0.229% |
+| bench_pgo perfscore | **-0.311%** | -0.310% | -0.296% |
+| non-PGO perfscore | -0.242% | -0.215% | (untested) |
+| arm64 elig perfscore | -0.769% | **-0.882%** | -0.759% |
+| **BDN wall-clock arith** | **+0.687%** | -1.554% | **-2.372%** |
+| **BDN wins/losses** | 3/4 | 6/1 | **6/0** |
+
+Perfscore optimizes for a JIT-time cost function; wall-clock
+optimizes for actual runtime. They diverge here by design -- the
+perfscore model rewards apparent CSE hits without accounting for
+register-pressure spill costs at runtime. Higher threshold means
+more conservative CSE application, avoiding those spills, at some
+cost to the perfscore-optimal count.
