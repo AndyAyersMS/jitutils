@@ -99,6 +99,10 @@ METHOD_SCHEMA = [
     # Default to 0 in cached JSON that predates the ISA-onehot patch.
     ("is_x64",                    FEATURE_KIND_BOOL),
     ("is_arm64",                  FEATURE_KIND_BOOL),
+    # On-stack-replacement flag. True for Tier1-OSR methods (mid-loop
+    # entry with locals inherited from the interpreter frame).
+    # Default to 0 in cached JSON that predates the is_osr patch.
+    ("is_osr",                    FEATURE_KIND_BOOL),
 ]
 
 FEATURES_PER_CANDIDATE = len(PER_CANDIDATE_SCHEMA)   # 30
@@ -408,6 +412,7 @@ class JitCseEnv(gym.Env):
             float(method.has_pgo_dynamic),
             float(method.is_x64),
             float(method.is_arm64),
+            float(method.is_osr),
         ], dtype=np.float32)
 
         return {"candidates": candidates, "method": method_arr}

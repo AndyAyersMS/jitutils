@@ -192,6 +192,12 @@ class MethodContext(BaseModel):
     # the 11-slot maxMethodFeatures bump.
     is_x64                   : bool = False
     is_arm64                 : bool = False
+    # On-stack-replacement flag emitted by CSE_HeuristicRLHook. True for
+    # Tier1-OSR methods (entered mid-loop with locals inherited from the
+    # interpreter frame, characteristic register-pressure profile).
+    # Default False for backwards-compat with cached JSON produced before
+    # the 12-slot maxMethodFeatures bump.
+    is_osr                   : bool = False
 
     def __str__(self):
         return f"{self.index}: {self.name}"

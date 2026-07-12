@@ -280,7 +280,7 @@ def test_get_observation_produces_dict_with_correct_shapes():
     # is_x64, is_arm64].
     np.testing.assert_array_equal(
         obs["method"],
-        np.array([42, 7, 3, 1, 0, 50000, 100000, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32),
+        np.array([42, 7, 3, 1, 0, 50000, 100000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32),
     )
 
 
