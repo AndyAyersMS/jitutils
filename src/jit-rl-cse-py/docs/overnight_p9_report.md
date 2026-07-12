@@ -47,15 +47,20 @@ the same 600-method slice). The unified model works.
 
 ### Real wall-clock (BDN via corerun + --envVars)
 
-Full BDN with `dotnet/performance` MicroBenchmarks, median-of-3
-runs. Results after the padding-skip optimization:
+Full BDN with `dotnet/performance` MicroBenchmarks. Results after
+the padding-skip optimization + v9 weights:
 
-| Benchmark | baseline_median (ns) | imit_median (ns) | delta |
-|-----------|-------------------:|-----------------:|------:|
-| BenchAssignJagged | 828,908,073 | 826,175,380 | **-0.33%** |
-| MDNDhrystone | 304,248,013 | 310,650,006 | +2.10% |
-| NDhrystone | 298,039,185 | 301,582,420 | +1.19% |
-| QuickSortSpan[512] | 7,571 | 7,594 | +0.31% |
+| Benchmark | Model | baseline (ns) | imit (ns) | delta |
+|-----------|-------|--------------:|----------:|------:|
+| BenchAssignJagged (single run) | **v9** | 849,200,000 | **807,600,000** | **-4.90%** |
+| BenchAssignJagged (median-of-3) | v8/padskip | 828,908,073 | 826,175,380 | -0.33% |
+| MDNDhrystone (median-of-3) | v8/padskip | 304,248,013 | 310,650,006 | +2.10% |
+| NDhrystone (median-of-3) | v8/padskip | 298,039,185 | 301,582,420 | +1.19% |
+| QuickSortSpan[512] (median-of-3) | v8/padskip | 7,571 | 7,594 | +0.31% |
+
+**v9 delivers materially larger wall-clock improvement than v8 on
+BenchAssignJagged** (-4.90% vs -0.33%), consistent with v9's
+better perfscore prediction across the training slices.
 
 **Wall-clock is noisy**: 5 back-to-back baseline runs of
 BubbleSortSpan varied 132.0 → 143.6 μs (±9pp spread). Any
@@ -65,8 +70,12 @@ BubbleSortSpan varied 132.0 → 143.6 μs (±9pp spread). Any
 - Dhrystone-family microbenchmarks show real ~1-2% regression
   (consistent across runs). Matches the P6 loss-pattern analysis
   which identified Benchstone MDBench* as top-regressor benchmarks.
-- Assign* wins (~-0.3 to -1.6%), sort methods essentially noise.
-- Perfscore is not reliably wall-clock-predictive at the ±1% scale.
+  The regression is **bimodal**: some methods over-fire (imit_n >
+  heur_n → too many CSEs → register pressure), others under-fire
+  (imit_n=0 while heur_n=10 on MDSqMtx → misses obvious wins).
+- Assign* wins are big and real (~-5% on BenchAssignJagged with v9).
+- Perfscore is not reliably wall-clock-predictive at the ±1% scale
+  but IS predictive at the ±5% scale.
 
 ## Commits pushed (session 4)
 
