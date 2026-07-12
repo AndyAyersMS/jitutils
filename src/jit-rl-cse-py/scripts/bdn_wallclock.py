@@ -97,39 +97,52 @@ def main():
     p.add_argument("--out-csv", required=True)
     p.add_argument("--save-dir", default=None,
                    help="Directory to copy BDN JSON reports into (default: alongside out-csv).")
+    p.add_argument("--n-runs", type=int, default=1,
+                   help="Number of times to repeat each (filter, config) pair. Median across "
+                        "runs is reported. Default 1.")
     args = p.parse_args()
 
     save_dir = args.save_dir or os.path.join(os.path.dirname(os.path.abspath(args.out_csv)),
                                              "bdn_raw")
     os.makedirs(save_dir, exist_ok=True)
 
-    all_baseline = {}
-    all_imit = {}
+    # For each (filter, config) accumulate a list of runs.
+    baseline_runs = {}  # bench_key -> list[float]
+    imit_runs = {}
 
     for filt in args.filter:
         print(f"\n=== filter: {filt} ===")
-        tag = filt.strip('*').replace('*', '_').replace('.', '_').replace('+', '_').replace(':', '_')
-        base = _run_bdn(args.dotnet, args.dll, filt, args.corerun, False,
-                        args.threshold, args.workdir, save_dir, run_tag=f"baseline_{tag}")
-        imit = _run_bdn(args.dotnet, args.dll, filt, args.corerun, True,
-                        args.threshold, args.workdir, save_dir, run_tag=f"imit_{tag}")
-        all_baseline.update(base)
-        all_imit.update(imit)
+        tag_base = filt.strip('*').replace('*', '_').replace('.', '_').replace('+', '_').replace(':', '_')
+        for run_idx in range(args.n_runs):
+            base = _run_bdn(args.dotnet, args.dll, filt, args.corerun, False,
+                            args.threshold, args.workdir, save_dir,
+                            run_tag=f"baseline_{tag_base}_r{run_idx}")
+            for k, v in base.items():
+                baseline_runs.setdefault(k, []).append(v)
+            imit = _run_bdn(args.dotnet, args.dll, filt, args.corerun, True,
+                            args.threshold, args.workdir, save_dir,
+                            run_tag=f"imit_{tag_base}_r{run_idx}")
+            for k, v in imit.items():
+                imit_runs.setdefault(k, []).append(v)
 
-    print("\n" + "=" * 80)
-    print(f"{'Benchmark':60s}  {'base_ns':>12s}  {'imit_ns':>12s}  {'delta':>8s}")
-    print("-" * 80)
+    print("\n" + "=" * 100)
+    print(f"{'Benchmark':60s}  {'base_med':>12s}  {'imit_med':>12s}  {'delta':>8s}  {'runs':>6s}")
+    print("-" * 100)
     rows = []
-    for name in sorted(set(all_baseline) & set(all_imit)):
-        b = all_baseline[name]
-        i = all_imit[name]
-        delta_pct = (i - b) / b * 100
-        print(f"{name[:60]:60s}  {b:>12.1f}  {i:>12.1f}  {delta_pct:>+7.2f}%")
-        rows.append((name, b, i, delta_pct))
+    for name in sorted(set(baseline_runs) & set(imit_runs)):
+        bs = sorted(baseline_runs[name])
+        ims = sorted(imit_runs[name])
+        b_med = bs[len(bs)//2]
+        i_med = ims[len(ims)//2]
+        delta_pct = (i_med - b_med) / b_med * 100
+        b_range = f"[{min(bs):.0f},{max(bs):.0f}]"
+        print(f"{name[:60]:60s}  {b_med:>12.1f}  {i_med:>12.1f}  {delta_pct:>+7.2f}%  {args.n_runs:>6d}")
+        rows.append((name, b_med, i_med, delta_pct, min(bs), max(bs), min(ims), max(ims)))
 
     with open(args.out_csv, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["benchmark", "baseline_ns", "imit_ns", "delta_pct"])
+        w.writerow(["benchmark", "baseline_median_ns", "imit_median_ns", "delta_pct",
+                    "baseline_min", "baseline_max", "imit_min", "imit_max"])
         for r in rows:
             w.writerow(r)
     print(f"\nWrote {args.out_csv}")
