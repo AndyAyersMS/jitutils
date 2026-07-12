@@ -97,3 +97,44 @@ After fix + retrain (v10):
 - **v11 attempt**: raise the training BCE `pos_weight_cap` or lower
   it, see if that shifts the peak threshold and helps small-hot-loop
   methods.
+
+## Broader BDN sample (v10, median-of-3, 8 benchmarks)
+
+| Benchmark | baseline (ns) | imit (ns) | delta |
+|-----------|--------------:|----------:|------:|
+| BenchAssignJagged | 821,857,771 | 817,873,943 | **-0.48%** |
+| MDMulMatrix | 818,960,293 | 798,647,671 | **-2.48%** |
+| RayTracerBench | 308,805,939 | 295,755,193 | **-4.23%** |
+| benchMonteCarlo | 588,979,120 | 583,929,929 | -0.86% |
+| MDLogicArray | 294,175,850 | 311,030,229 | **+5.73%** |
+| NDhrystone | 294,870,200 | 297,478,771 | +0.88% |
+| QuickSortSpan | 7,325 | 7,740 | +5.67% (noisy) |
+| benchFFT | 513,484,631 | 519,960,729 | +1.26% |
+| **Arith mean** | | | **+0.69%** |
+| **Wins** | 3 | | (<-0.5pp) |
+| **Losses** | 4 | | (>+0.5pp) |
+
+**Pattern**: v10 wins on realistic multi-array numerical kernels
+(RayTracer, MDMulMatrix, BenchAssignJagged, MonteCarlo) and loses on
+tight small-loop microbenchmarks (MDLogicArray, NDhrystone, FFT).
+Consistent with training data being dominated by larger real-world
+methods (7 sources = 4 tier1 PGO + non-PGO + arm64 + realworld).
+
+QuickSortSpan swings between -3.89% (previous median-of-3) and +5.67%
+here — it's noise-dominated even with median-of-3, not a real regression.
+
+## Persistent regression pattern
+
+Consistent across the last several BDN runs and cross-referenced with
+the P6 loss-pattern analysis:
+- **Winners**: realistic multi-array workloads (matrix multiply, ray
+  tracing, JSON parse, jagged-array assignment)
+- **Losers**: tight micro-kernels where the heuristic already produces
+  near-optimal small subsets (Dhrystone, LogicArray, small sort loops)
+
+The heuristic was probably tuned on classic Byte-magazine-style
+benchmarks. Imitation model wasn't heavily trained on that
+distribution.
+
+**Fix directions**: (a) add small-hot-loop signal (b) bump `pos_weight_cap`
+lower to be more conservative (c) label more MDBench methods
