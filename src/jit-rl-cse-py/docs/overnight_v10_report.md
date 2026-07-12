@@ -199,3 +199,40 @@ perfscore model rewards apparent CSE hits without accounting for
 register-pressure spill costs at runtime. Higher threshold means
 more conservative CSE application, avoiding those spills, at some
 cost to the perfscore-optimal count.
+
+### Threshold=0.60 (checking for higher-is-better trend)
+
+| Benchmark | t=0.50 | t=0.60 |
+|-----------|-------:|-------:|
+| BenchAssignJagged | -2.79% | **+3.44%** (regressed!) |
+| MDLogicArray | -5.75% | -5.54% |
+| MDMulMatrix | -2.07% | -1.70% |
+| NDhrystone | -1.24% | +0.15% (noise) |
+| QuickSortSpan | -0.44% | -2.50% |
+| RayTracerBench | -4.71% | -0.75% |
+| benchFFT | -0.01% | +0.66% |
+| benchMonteCarlo | -1.97% | -1.15% |
+| **Arith mean** | **-2.372%** | -0.924% |
+| **wins/losses/same** | **6/0/2** | 5/2/1 |
+
+Going HIGHER than 0.50 REGRESSES. BenchAssignJagged flips from a big
+win at 0.50 (-2.79%) to a big loss at 0.60 (+3.44%). Confirmed
+**t=0.50 is the wall-clock optimum** for this sample. Higher
+thresholds start missing genuinely-beneficial CSEs.
+
+### Final threshold curve on the broader BDN sample
+
+```
+      wall-clock arith mean vs threshold (v10, 8 BDN benchmarks)
+
+  +1.0% |
+        |     +
+   0.0% ------+---------+----+----+
+        |          +               \
+  -1.0% |                     +      +   <- t=0.60
+        |                               \
+  -2.0% |                     +           +  <- t=0.50 (optimum)
+        |                                     
+        +-----+---------+----+----+----+----+
+             0.30      0.40 0.50 0.60
+```
