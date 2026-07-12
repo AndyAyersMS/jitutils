@@ -138,3 +138,26 @@ distribution.
 
 **Fix directions**: (a) add small-hot-loop signal (b) bump `pos_weight_cap`
 lower to be more conservative (c) label more MDBench methods
+
+## Threshold-0.40 sweep on the same broader BDN set (median-of-3)
+
+| Benchmark | delta @ t=0.30 | delta @ t=0.40 |
+|-----------|---------------:|---------------:|
+| BenchAssignJagged | -0.48% | **-2.53%** |
+| MDLogicArray | +5.73% | **-5.56%** |
+| MDMulMatrix | -2.48% | -1.80% |
+| NDhrystone | +0.88% | **-0.99%** |
+| QuickSortSpan | +5.67% (noise) | +1.59% (noise) |
+| RayTracerBench | -4.23% | -1.70% |
+| benchFFT | +1.26% | **-0.26%** |
+| benchMonteCarlo | -0.86% | -1.19% |
+| **Arith mean** | +0.687% | **-1.554%** |
+| **wins/losses/same** | 3/4/1 | **6/1/1** |
+
+**Decisive win for t=0.40 as the default.** MDLogicArray alone swings
+11pp from a big regression to a big win. The perfscore sweeps had
+also shown t=0.40 at or near peak on 3 of 4 axes, so no
+perfscore-side trade-off.
+
+**Landed in commit `d72bdb97af4`**: JitCseImitationThreshold default
+changed from 0.30 to 0.40. Users can still override.
