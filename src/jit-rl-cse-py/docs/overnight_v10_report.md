@@ -1,0 +1,99 @@
+# Overnight session 5 — v10 + overflow-bug fix
+
+**Session**: 2026-07-11 15:00 → 2026-07-12 (continued)
+**Runtime branch**: `AndyAyersMS/runtime@jit-cse-imitation-v7` @ `c357465af74`
+**jitutils branch**: `AndyAyersMS/jitutils@revive-jit-rl-cse-py` @ `b5a13f0`
+
+## Ship state: v10
+
+`clrjit.dll` now bakes **v10** — trained on **7 sources / ~32,578 labels**
+after fixing an integer overflow bug in the JIT's RLHook feature
+emission.
+
+**All axes IMPROVED** (perfscore delta vs heuristic, embedded C++, Checked):
+
+| MCH | Distribution | v9 best | **v10 best** |
+|-----|-------------|--------:|-------------:|
+| test.mch (750) | PGO Tier1 | -0.225% | **-0.243%** |
+| bench_pgo (5000) | PGO Tier1 | -0.285% | **-0.311%** |
+| non-PGO (3000) | FullOpts | -0.237% | **-0.246%** |
+| arm64 eligible (600) | PGO Tier1 | -0.818% | **-0.882%** |
+
+**Real BDN wall-clock (median-of-3, Release):**
+
+| Benchmark | v8 | v9 (1 run) | **v10 (median-of-3)** |
+|-----------|---:|-----------:|----------------------:|
+| BenchAssignJagged | -0.33% | -4.90% | **-2.51%** |
+| MDSqMtx | +55% perfscore! | (n/a) | **-0.31%** |
+| QuickSortSpan[512] | +0.31% | (n/a) | **-3.89%** |
+| NDhrystone | +1.19% | (n/a) | +0.48% |
+| MDNDhrystone | +2.10% | (n/a) | +2.07% |
+| **Arith mean** | **+0.82%** (regress) | (n/a) | **-0.835%** (WIN) |
+
+## The overflow bug
+
+Discovered while investigating MDSqMtx regression (+55% perfscore
+with v8/v9):
+
+The JIT emits `(int)(csdUseWtCnt * 100.0 + 0.5)` and
+`(int)(m_aggressiveRefCnt * 1000.0 + 0.5)` as fixed-point method
+features. On very hot Tier1-PGO methods where the weight exceeds
+~21 million (multiplied gives >INT_MAX ≈ 2.1B), these expressions
+overflow signed int and wrap to **-2,147,483,648** (INT_MIN).
+
+Downstream, the Python-side normalization does `log1p(x)` and
+`x / 1000.0`, which on INT_MIN produces NaN or garbage. The
+imitation model then sees NaN inputs → outputs low-confidence
+sigmoid values → applies zero CSEs.
+
+For MDSqMtx (double-precision matrix inner loop):
+- Baseline heuristic: applies 10 CSEs, perfscore 42,595,000
+- v8/v9 imitation: applies **0 CSEs**, perfscore 66,383,972 (+55%)
+
+**Fix** (commit `98d6c5490e7`): saturate to INT_MAX before the cast.
+Same pattern in both per-candidate (use/def wt cnt) and method-level
+(aggressive/moderate ref cnt) features.
+
+After fix + retrain (v10):
+- v10 imitation: applies **12 CSEs**, perfscore 45,644,972 (-31% vs
+  the pre-fix broken behavior; effectively neutral wall-clock vs
+  heuristic)
+
+## Session 5 commits
+
+**runtime** (`jit-cse-imitation-v7`):
+- `98d6c5490` fix INT_MIN overflow in RLHook wt_cnt / ref_cnt features
+- `c357465af` bake v10 weights (7 sources, clean features)
+
+**jitutils** (`revive-jit-rl-cse-py`):
+- `b5a13f0` add v9 wallclock -4.90 pct on BenchAssignJagged
+- (v10 docs pending)
+
+## Cumulative session 3+4+5 highlights
+
+- **v7_early → v10**: 4 model iterations, all delivered improvements
+- **10.4% → 1.5% JIT overhead** (7× reduction via padding-skip)
+- **DEBUG → Release deployment** with 100% parity preserved
+- **Wall-clock net regression → net improvement** (v8 +0.82% → v10 -0.84%)
+- **Cross-ISA parity**: v10 unified matches arm64-specialist within 0.08pp
+- **Integer overflow bug** discovered and fixed in JIT feature emission
+
+## Remaining known limitations
+
+- **MDNDhrystone** still regresses ~2% wall-clock. Not a hot-loop
+  overflow issue (values are within range). Real algorithmic
+  disagreement between imit and heuristic.
+- Full BDN suite not run (only ~10 benchmarks measured).
+- arm64 wall-clock validation not done (no arm64 hardware).
+
+## Next steps
+
+- **Long BDN suite** covering all 27 impacted benchmark classes from
+  `docs/impacted_benchmarks.md`.
+- **Investigate MDNDhrystone**: what specific CSEs does imit apply
+  differently from heuristic, and why does it hurt?
+- **Retrain arm64 specialist** on clean features (v8_arm64 was
+  trained pre-overflow-fix).
+- **v11 attempt**: raise the training BCE `pos_weight_cap` or lower
+  it, see if that shifts the peak threshold and helps small-hot-loop
+  methods.
