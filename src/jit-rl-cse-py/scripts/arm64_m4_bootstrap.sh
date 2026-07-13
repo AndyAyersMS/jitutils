@@ -108,9 +108,11 @@ export DOTNET_ROOT="$PERF_DIR/.dotnet"
 
 cd "$PERF_DIR/src/benchmarks/micro"
 
-# Build MicroBenchmarks for the single TFM we care about.
-# `dotnet build -c Release -f net10.0` restores + compiles only for net10.0.
-dotnet build -c Release -f "$BENCH_TFM"
+# Build the .csproj directly (not the .sln) so Reporting.csproj (netstandard2.0)
+# isn't force-built for net10.0. The csproj-direct path consumes Reporting's
+# netstandard2.0 assets naturally.
+rm -rf obj bin
+dotnet build MicroBenchmarks.csproj -c Release -f "$BENCH_TFM"
 
 BENCH_DLL="$PERF_DIR/artifacts/bin/MicroBenchmarks/Release/$BENCH_TFM/MicroBenchmarks.dll"
 if [[ ! -f "$BENCH_DLL" ]]; then

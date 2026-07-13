@@ -33,11 +33,17 @@ exec > >(tee -a "$LOG") 2>&1
 echo "Start: $(date)"
 
 echo "=== Step 0: install deps ==="
-# Detect package manager (apt = Ubuntu/Debian, dnf/yum = AL/RHEL/Fedora)
+# Detect package manager (apt=Ubuntu, dnf=RHEL/Fedora/AL, tdnf=Azure Linux/Mariner)
 if command -v apt-get >/dev/null 2>&1; then
     sudo apt-get update
     sudo apt-get install -y git build-essential cmake ninja-build clang python3 python3-pip curl zip \
         libssl-dev libkrb5-dev liblttng-ust-dev libunwind-dev libnuma-dev libicu-dev tar libcurl4-openssl-dev
+elif command -v tdnf >/dev/null 2>&1; then
+    # Azure Linux 3 / CBL-Mariner
+    sudo tdnf install -y git gcc glibc-devel make cmake ninja-build clang python3 python3-pip ca-certificates \
+        curl zip tar which util-linux \
+        openssl-devel krb5-devel libunwind-devel numactl-devel icu icu-devel libcurl-devel \
+        lttng-ust-devel binutils gcc-c++
 elif command -v dnf >/dev/null 2>&1; then
     sudo dnf install -y git gcc gcc-c++ make cmake ninja-build clang python3 python3-pip curl zip tar which \
         openssl-devel krb5-devel libunwind-devel numactl-devel libicu libicu-devel libcurl-devel \
@@ -47,7 +53,7 @@ elif command -v yum >/dev/null 2>&1; then
         openssl-devel krb5-devel libunwind-devel numactl-devel libicu libicu-devel libcurl-devel \
         lttng-ust-devel
 else
-    echo "ERROR: no known package manager (apt/dnf/yum)" >&2
+    echo "ERROR: no known package manager (apt/tdnf/dnf/yum)" >&2
     exit 1
 fi
 
@@ -122,7 +128,11 @@ export DOTNET_ROOT="$PERF_DIR/.dotnet"
 BENCH_TFM="net10.0"
 export PERFLAB_TARGET_FRAMEWORKS="$BENCH_TFM"
 cd "$PERF_DIR/src/benchmarks/micro"
-dotnet build -c Release -f "$BENCH_TFM"
+# Build the .csproj directly (not the .sln) so Reporting.csproj (netstandard2.0)
+# isn't force-built for net10.0. The csproj-direct path consumes Reporting's
+# netstandard2.0 assets naturally.
+rm -rf obj bin
+dotnet build MicroBenchmarks.csproj -c Release -f "$BENCH_TFM"
 
 BENCH_DLL="$PERF_DIR/artifacts/bin/MicroBenchmarks/Release/$BENCH_TFM/MicroBenchmarks.dll"
 if [[ ! -f "$BENCH_DLL" ]]; then
