@@ -120,8 +120,9 @@ export PATH="$PERF_DIR/.dotnet:$PATH"
 export DOTNET_ROOT="$PERF_DIR/.dotnet"
 
 BENCH_TFM="net10.0"
+export PERFLAB_TARGET_FRAMEWORKS="$BENCH_TFM"
 cd "$PERF_DIR/src/benchmarks/micro"
-dotnet build -c Release -f "$BENCH_TFM" || dotnet run -c Release -f "$BENCH_TFM" -- --list flat
+dotnet build -c Release -f "$BENCH_TFM"
 
 BENCH_DLL="$PERF_DIR/artifacts/bin/MicroBenchmarks/Release/$BENCH_TFM/MicroBenchmarks.dll"
 if [[ ! -f "$BENCH_DLL" ]]; then

@@ -85,19 +85,32 @@ if [[ ! -d "$PERF_DIR" ]]; then
     echo "Cloning dotnet/performance to $PERF_DIR..."
     git clone --depth 1 https://github.com/dotnet/performance "$PERF_DIR"
 fi
+
+# Force a specific TFM: net10.0 is the most-stable currently-supported target.
+# PERFLAB_TARGET_FRAMEWORKS is what MicroBenchmarks.csproj reads to narrow the
+# set of TFMs it builds -- without this it tries all supported (net8..net11)
+# and restore only pulls one, causing "does not have a target for netX.0".
+BENCH_TFM="net10.0"
+export PERFLAB_TARGET_FRAMEWORKS="$BENCH_TFM"
+echo "  using TFM: $BENCH_TFM (PERFLAB_TARGET_FRAMEWORKS=$PERFLAB_TARGET_FRAMEWORKS)"
+
+# Install the SDK the perf repo wants (via its dotnet-install) if not on PATH
+if [[ ! -x "$PERF_DIR/.dotnet/dotnet" ]]; then
+    cd "$PERF_DIR"
+    if [[ ! -f dotnet-install.sh ]]; then
+        curl -fsSL -o dotnet-install.sh https://dot.net/v1/dotnet-install.sh
+        chmod +x dotnet-install.sh
+    fi
+    ./dotnet-install.sh --jsonfile global.json --install-dir "$PERF_DIR/.dotnet"
+fi
+export PATH="$PERF_DIR/.dotnet:$PATH"
+export DOTNET_ROOT="$PERF_DIR/.dotnet"
+
 cd "$PERF_DIR/src/benchmarks/micro"
 
-# Determine which TFM the perf repo expects (net10.0 typically)
-BENCH_TFM="net10.0"
-if grep -q net11 MicroBenchmarks.csproj 2>/dev/null; then
-    BENCH_TFM="net11.0"
-fi
-echo "  using TFM: $BENCH_TFM"
-
-# Build MicroBenchmarks using perf repo's own dotnet install
-echo "Building MicroBenchmarks (this may install SDK from global.json first)..."
-"$PERF_DIR"/eng/common/build.sh --restore --build --configuration Release --projects "$PERF_DIR/src/benchmarks/micro/MicroBenchmarks.csproj" || \
-    dotnet build -c Release -f "$BENCH_TFM"
+# Build MicroBenchmarks for the single TFM we care about.
+# `dotnet build -c Release -f net10.0` restores + compiles only for net10.0.
+dotnet build -c Release -f "$BENCH_TFM"
 
 BENCH_DLL="$PERF_DIR/artifacts/bin/MicroBenchmarks/Release/$BENCH_TFM/MicroBenchmarks.dll"
 if [[ ! -f "$BENCH_DLL" ]]; then
