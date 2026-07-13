@@ -62,6 +62,8 @@ def main():
     ap.add_argument('--save-dir', default=None)
     ap.add_argument('--filter', action='append', required=True)
     ap.add_argument('--n-runs', type=int, default=3)
+    ap.add_argument('--v10-threshold', default='0.50')
+    ap.add_argument('--v11-threshold', default='0.30')
     args = ap.parse_args()
 
     save_dir = args.save_dir or os.path.dirname(os.path.abspath(args.out_csv))
@@ -89,7 +91,7 @@ def main():
             for cfg in ['base', 'imit']:
                 env_extra = None
                 if cfg == 'imit':
-                    thr = '0.50' if jit_ver == 'v10' else '0.30'
+                    thr = args.v10_threshold if jit_ver == 'v10' else args.v11_threshold
                     env_extra = [
                         'DOTNET_JitCseImitation:1',
                         f'DOTNET_JitCseImitationThreshold:{thr}',
