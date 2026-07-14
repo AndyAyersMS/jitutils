@@ -85,7 +85,7 @@ build_and_save() {
     git checkout -B "$branch-local" "origin/$branch"
     # Force JIT rebuild if source timestamps don't reflect the branch switch
     touch src/coreclr/jit/optcse.cpp src/coreclr/jit/optcse.h src/coreclr/jit/cse_imitation_v7_weights.h 2>/dev/null || true
-    ./build.sh clr+libs -c Release
+    ./build.sh clr+libs -c Release -p:FeatureXplatEventSource=false
     src_jit="$RUNTIME_DIR/artifacts/bin/coreclr/linux.arm64.Release/libclrjit.so"
     if [[ ! -f "$src_jit" ]]; then
         echo "ERROR: libclrjit.so not found at $src_jit" >&2
